@@ -1,9 +1,0 @@
-{
-  "identifier": "pipeline_self_admin",
-  "name": "pipeline-self-admin",
-  "email": "pipeline-self-admin@service.harness.io",
-  "description": "SA used by main pipeline to abort prior ApprovalWaiting executions of the same pipeline.",
-  "tags": {
-    "managedByTerraform": ""
-  }
-}

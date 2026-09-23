@@ -1,7 +1,0 @@
-{
-  "identifier": "LarkApprover",
-  "name": "LarkApprover",
-  "email": "lark-approver@machinepulse.ai",
-  "description": "Argus Lark approval bot — proxies clicks from the Lark approval  card to Harness",
-  "tags": {}
-}

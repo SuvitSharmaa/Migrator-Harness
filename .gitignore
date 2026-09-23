@@ -2,3 +2,4 @@
 .mcp.json
 .env
 .claude/settings.local.json
+customer-exports/
