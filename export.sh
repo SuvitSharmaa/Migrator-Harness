@@ -14,22 +14,53 @@
 #   <scope>/environments/*.yaml        environment YAML
 #   <scope>/environments/<env>.infra/*.yaml   infrastructure YAML per env
 #   <scope>/pipelines/*.yaml           pipeline YAML
-#   <scope>/templates/*.json           template (versioned) definitions
+#   <scope>/templates/<id>__<ver>.yaml template YAML, one file per version
 #   <scope>/filestore/...              file-store files + folder manifest
-# where <scope> is "account" or "<org>__<project>".
+# where <scope> is "account", "org-scope__<org>" (org-only — see project mode
+# below), or "<org>__<project>".
 #
 # Usage:
-#   HARNESS_TOKEN=eyJ... ./export.sh
+#   HARNESS_TOKEN=eyJ... ./export.sh                                    # full account
+#   HARNESS_TOKEN=eyJ... SRC_ORG=default SRC_PROJECT=Alice ./export.sh  # single project
+#
+# Setting SRC_ORG + SRC_PROJECT restricts the export to that one project scope
+# only — no "account" scope, no other projects, EXCEPT: account-/org-scoped
+# secrets and connectors that the project's own resources actually reference
+# by identifier (e.g. connectorRef: account.foo) are detected and pulled in
+# too (into "account" / "org-scope__<org>" dirs), since a fresh target won't
+# have them yet. Everything else at account/org scope (service accounts,
+# user groups, unreferenced connectors/secrets, etc.) is still assumed to
+# already exist in the target and is not exported.
 #
 set -uo pipefail
 
-TOKEN="${HARNESS_TOKEN:?set HARNESS_TOKEN to a source bearer token}"
+TOKEN="${HARNESS_TOKEN:?set HARNESS_TOKEN to a source bearer token / x-api-key}"
 ACC="${SRC_ACCOUNT_ID:-ZmMyYzk4NDktZmU4Ny00Zm}"
 BASE="${SRC_BASE_URL:-https://prod5.harness.io/gateway}"
 OUT="${OUT_DIR:-./harness-export}"
-H=(-H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -H 'accept: */*')
+SRC_ORG="${SRC_ORG:-}"
+SRC_PROJECT="${SRC_PROJECT:-}"
+
+# Auth header: a real API key uses x-api-key; a UI JWT uses Authorization: Bearer.
+# Token starting with "pat." or "sat." => API key; else treat as bearer.
+# (Must match import.sh/secrets.sh — sending a PAT as "Bearer" gets silently
+# rejected by Harness and looks like a missing-resource error downstream.)
+if [[ "$TOKEN" == pat.* || "$TOKEN" == sat.* ]]; then
+  AUTH=(-H "x-api-key: $TOKEN")
+else
+  AUTH=(-H "authorization: Bearer $TOKEN")
+fi
+H=("${AUTH[@]}" -H 'content-type: application/json' -H 'accept: */*')
 
 command -v jq >/dev/null || { echo "jq required" >&2; exit 1; }
+command -v yq >/dev/null || { echo "yq required (brew install yq)" >&2; exit 1; }
+
+if [[ -n "$SRC_ORG" && -z "$SRC_PROJECT" ]] || [[ -z "$SRC_ORG" && -n "$SRC_PROJECT" ]]; then
+  echo "set both SRC_ORG and SRC_PROJECT for a single-project export, or leave both unset for a full account export" >&2
+  exit 1
+fi
+PROJECT_MODE=0
+[[ -n "$SRC_ORG" && -n "$SRC_PROJECT" ]] && PROJECT_MODE=1
 
 # --- scope helpers -----------------------------------------------------------
 # A scope is "account" or "<org>/<project>".
@@ -39,26 +70,158 @@ scope_qs() {
     */*)     echo "accountIdentifier=$ACC&orgIdentifier=${1%%/*}&projectIdentifier=${1##*/}" ;;
   esac
 }
-scope_dir() { case "$1" in account) echo account ;; */*) echo "${1%%/*}__${1##*/}" ;; esac; }
+scope_dir() { case "$1" in account) echo account ;; org:*) echo "org-scope__${1#org:}" ;; */*) echo "${1%%/*}__${1##*/}" ;; esac; }
 
 get()  { curl -s "${H[@]}" "$BASE/$1"; }
 post() { curl -s "${H[@]}" -X POST "$BASE/$1" --data-raw "$2"; }
 
+# paginate_content METHOD PATH [BODY] [EXTRACT] -> {"data":{"content":[...]}}
+# with every page's items merged into one deduped array. EXTRACT is a jq
+# filter picking the item array out of a page's response (default
+# ".data.content"; e.g. service accounts sometimes return a raw array under
+# `.data` instead — pass '(.data | if type=="array" then . else .content end)').
+#
+# PATH already carries pageSize=1000 as a *hint*, but several list endpoints
+# (confirmed: pipelines; likely others) silently cap their real page size far
+# below that and return only page 0 — no error, just a short result. A
+# single-page fetch with pageSize=1000 previously returned 25 of a project's
+# 478 real pipelines with no indication anything was missing.
+#
+# Stops when a fetched page contributes ZERO items not already seen — not
+# simply "page came back empty". That covers two failure modes: an endpoint
+# that properly paginates (ends on a genuinely empty page), AND one that
+# doesn't honor pageIndex at all and just re-returns the same full result
+# every time (stops after 2 calls once the "next page" adds nothing new,
+# instead of re-appending the same items until the safety valve trips).
+paginate_content() {
+  local method="$1" path="$2" body="${3:-}" extract="${4:-.data.content}"
+  local page=0 acc='[]' resp got n merged old_count new_count qs_page body_paged
+  while :; do
+    # Send both pagination-param naming conventions Harness services use
+    # (pageIndex/pageSize vs page/size) in the query string — and, for POST
+    # calls, ALSO in the JSON body, since some /list endpoints that take a
+    # filter body read pagination from the body and ignore the query string
+    # entirely. Cheap and harmless if the server only recognizes one form.
+    qs_page="&pageIndex=${page}&page=${page}"
+    if [[ "$method" == POST ]]; then
+      body_paged="$(echo "$body" | jq -c --argjson pi "$page" \
+        '. + {pageIndex: $pi, page: $pi}' 2>/dev/null)"
+      [[ -z "$body_paged" ]] && body_paged="$body"
+      resp="$(post "${path}${qs_page}" "$body_paged")"
+    else
+      resp="$(get "${path}${qs_page}")"
+    fi
+    got="$(echo "$resp" | jq -c "($extract) // []" 2>/dev/null)"
+    [[ -z "$got" || "$got" == "null" ]] && got='[]'
+    n="$(echo "$got" | jq 'length' 2>/dev/null)"; n="${n:-0}"
+    [[ "$n" -eq 0 ]] && break
+    old_count="$(echo "$acc" | jq 'length' 2>/dev/null)"; old_count="${old_count:-0}"
+    merged="$(jq -cn --argjson a "$acc" --argjson b "$got" '($a + $b) | unique' 2>/dev/null)"
+    [[ -z "$merged" ]] && merged="$acc"
+    new_count="$(echo "$merged" | jq 'length' 2>/dev/null)"; new_count="${new_count:-$old_count}"
+    [[ "$new_count" -eq "$old_count" ]] && break
+    acc="$merged"
+    page=$((page+1))
+    # Safety valve: a real pagination bug elsewhere shouldn't spin forever.
+    if [[ "$page" -gt 200 ]]; then
+      echo "  WARNING: paginate_content stopped after 200 pages for $path — results may be incomplete" >&2
+      break
+    fi
+  done
+  printf '{"data":{"content":%s}}' "$acc"
+}
+
+# iacm_list_workspaces ORG PROJ -> JSON array of every workspace (all pages
+# merged, deduped by identifier). IACM's list endpoint uses page/limit query
+# params (not pageIndex/pageSize) and returns a raw array (no `.data.content`
+# wrapper), so it can't go through paginate_content — same "stop when a page
+# adds nothing new" safety net, applied directly here instead.
+iacm_list_workspaces() {
+  local org="$1" proj="$2" page=1 acc='[]' resp n merged old_count new_count
+  while :; do
+    resp="$(curl -s "${AUTH[@]}" -H "harness-account: $ACC" -H 'accept: */*' \
+      "$BASE/iacm/api/orgs/$org/projects/$proj/workspaces?page=$page&limit=1000")"
+    if [[ "$(echo "$resp" | jq -e 'type=="array"' 2>/dev/null)" != "true" ]]; then resp='[]'; fi
+    n="$(echo "$resp" | jq 'length' 2>/dev/null)"; n="${n:-0}"
+    [[ "$n" -eq 0 ]] && break
+    old_count="$(echo "$acc" | jq 'length' 2>/dev/null)"; old_count="${old_count:-0}"
+    merged="$(jq -cn --argjson a "$acc" --argjson b "$resp" '($a + $b) | unique_by(.identifier)' 2>/dev/null)"
+    [[ -z "$merged" ]] && merged="$acc"
+    new_count="$(echo "$merged" | jq 'length' 2>/dev/null)"; new_count="${new_count:-$old_count}"
+    [[ "$new_count" -eq "$old_count" ]] && break
+    acc="$merged"
+    page=$((page+1))
+    if [[ "$page" -gt 200 ]]; then
+      echo "  WARNING: iacm workspace pagination stopped after 200 pages for $org/$proj — results may be incomplete" >&2
+      break
+    fi
+  done
+  printf '%s' "$acc"
+}
+
+# get_checked <path> <label> -> body on stdout; exits with a clear diagnostic
+# on a non-2xx response or an unexpected shape, instead of silently returning
+# a body that later cascades into "jq: Cannot iterate over null (null)" and
+# misleading "not found" errors further down the script.
+get_checked() {
+  local path="$1" label="$2" tmp code body
+  tmp="$(mktemp)"
+  code="$(curl -s -o "$tmp" -w '%{http_code}' "${H[@]}" "$BASE/$path")"
+  body="$(cat "$tmp")"; rm -f "$tmp"
+  if [[ ! "$code" =~ ^2 ]]; then
+    echo "ERROR: $label failed (HTTP $code) against $BASE" >&2
+    echo "  Check that SRC_BASE_URL points at the right cluster/gateway" >&2
+    echo "  (SaaS accounts usually need a /gateway suffix, e.g. https://app.harness.io/gateway)" >&2
+    echo "  and that HARNESS_TOKEN is valid, unexpired, and has read access to account $ACC." >&2
+    echo "  Response: $(echo "$body" | head -c 300)" >&2
+    exit 1
+  fi
+  if ! echo "$body" | jq -e '.data.content' >/dev/null 2>&1; then
+    echo "ERROR: $label returned HTTP 200 but not the expected shape (.data.content missing)." >&2
+    echo "  Response: $(echo "$body" | head -c 300)" >&2
+    exit 1
+  fi
+  printf '%s' "$body"
+}
+
 # --- discover scope tree -----------------------------------------------------
 mkdir -p "$OUT"
 echo "Discovering scope tree..."
-ORGS_JSON="$(get "ng/api/organizations?accountIdentifier=$ACC&routingId=$ACC&pageSize=200")"
-PROJ_JSON="$(get "ng/api/projects?accountIdentifier=$ACC&routingId=$ACC&pageSize=500")"
-echo "$ORGS_JSON" | jq '{orgs: [.data.content[].organization|{identifier,name,description,tags}]}' > "$OUT/_orgs.json"
-echo "$PROJ_JSON" | jq '{projects: [.data.content[].project|{orgIdentifier,identifier,name,description,color,modules,tags}]}' > "$OUT/_projects.json"
+# get_checked runs in a $(...) subshell, so its internal `exit 1` only kills
+# that subshell — it does NOT stop this script on its own. The exit status of
+# a bare `VAR="$(cmd)"` assignment IS cmd's exit status, so `|| exit 1` here
+# is what actually propagates the failure up instead of silently continuing
+# with an empty ORGS_JSON/PROJ_JSON.
+ORGS_JSON="$(get_checked "ng/api/organizations?accountIdentifier=$ACC&routingId=$ACC&pageSize=200" "list organizations")" || exit 1
+PROJ_JSON="$(get_checked "ng/api/projects?accountIdentifier=$ACC&routingId=$ACC&pageSize=500" "list projects")" || exit 1
+if [[ "$PROJECT_MODE" -eq 1 ]]; then
+  echo "$ORGS_JSON" | jq --arg o "$SRC_ORG" \
+    '{orgs: [.data.content[].organization | select(.identifier==$o) | {identifier,name,description,tags}]}' > "$OUT/_orgs.json"
+  echo "$PROJ_JSON" | jq --arg o "$SRC_ORG" --arg p "$SRC_PROJECT" \
+    '{projects: [.data.content[].project | select(.orgIdentifier==$o and .identifier==$p) | {orgIdentifier,identifier,name,description,color,modules,tags}]}' > "$OUT/_projects.json"
+else
+  echo "$ORGS_JSON" | jq '{orgs: [.data.content[].organization|{identifier,name,description,tags}]}' > "$OUT/_orgs.json"
+  echo "$PROJ_JSON" | jq '{projects: [.data.content[].project|{orgIdentifier,identifier,name,description,color,modules,tags}]}' > "$OUT/_projects.json"
+fi
 jq -s '{orgs: .[0].orgs, projects: .[1].projects}' "$OUT/_orgs.json" "$OUT/_projects.json" > "$OUT/scope.json"
 rm -f "$OUT/_orgs.json" "$OUT/_projects.json"
 
-# Build scope list: account + each project as org/project (bash 3.2 portable).
-SCOPES=(account)
-while IFS= read -r line; do
-  [[ -n "$line" ]] && SCOPES+=("$line")
-done < <(echo "$PROJ_JSON" | jq -r '.data.content[].project | "\(.orgIdentifier)/\(.identifier)"')
+if [[ "$PROJECT_MODE" -eq 1 ]]; then
+  found="$(jq '.projects|length' "$OUT/scope.json")"
+  [[ "$found" -eq 1 ]] || { echo "project '$SRC_ORG/$SRC_PROJECT' not found in source account $ACC" >&2; exit 1; }
+fi
+
+# Build scope list (bash 3.2 portable):
+#  - project mode: just the one requested project
+#  - account mode: account + every discovered project as org/project
+if [[ "$PROJECT_MODE" -eq 1 ]]; then
+  SCOPES=("$SRC_ORG/$SRC_PROJECT")
+else
+  SCOPES=(account)
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && SCOPES+=("$line")
+  done < <(echo "$PROJ_JSON" | jq -r '.data.content[].project | "\(.orgIdentifier)/\(.identifier)"')
+fi
 echo "Scopes: ${SCOPES[*]}"
 
 # Secret manifest header.
@@ -80,7 +243,7 @@ for SC in "${SCOPES[@]}"; do
   mkdir -p "$D"/{connectors,services,environments,pipelines,templates,filestore,serviceaccounts,usergroups,iacm-workspaces}
 
   # connectors (full spec returned inline by listV2)
-  CONN="$(post "ng/api/connectors/listV2?$QS&routingId=$ACC&pageSize=1000" '{"filterType":"Connector"}')"
+  CONN="$(paginate_content POST "ng/api/connectors/listV2?$QS&routingId=$ACC&pageSize=1000" '{"filterType":"Connector"}')"
   n=$(echo "$CONN" | jq '.data.content|length')
   echo "  connectors: $n"
   echo "$CONN" | jq -c '.data.content[].connector' | while read -r c; do
@@ -89,7 +252,7 @@ for SC in "${SCOPES[@]}"; do
   done
 
   # secrets -> manifest only (no values available)
-  SEC="$(get "ng/api/v2/secrets?$QS&routingId=$ACC&pageSize=1000")"
+  SEC="$(paginate_content GET "ng/api/v2/secrets?$QS&routingId=$ACC&pageSize=1000")"
   ns=$(echo "$SEC" | jq '.data.content|length')
   echo "  secrets:    $ns (manifest only)"
   if [[ "${ns:-0}" -gt 0 ]]; then
@@ -99,7 +262,7 @@ for SC in "${SCOPES[@]}"; do
   fi
 
   # services (yaml inline)
-  SVC="$(get "ng/api/servicesV2?$QS&routingId=$ACC&pageSize=1000")"
+  SVC="$(paginate_content GET "ng/api/servicesV2?$QS&routingId=$ACC&pageSize=1000")"
   echo "  services:   $(echo "$SVC" | jq '.data.content|length')"
   echo "$SVC" | jq -r '.data.content[].service | @base64' | while read -r row; do
     s=$(echo "$row" | base64 --decode)
@@ -108,13 +271,13 @@ for SC in "${SCOPES[@]}"; do
   done
 
   # environments (yaml inline) + their infrastructures
-  ENV="$(get "ng/api/environmentsV2?$QS&routingId=$ACC&pageSize=1000")"
+  ENV="$(paginate_content GET "ng/api/environmentsV2?$QS&routingId=$ACC&pageSize=1000")"
   echo "  envs:       $(echo "$ENV" | jq '.data.content|length')"
   echo "$ENV" | jq -r '.data.content[].environment | @base64' | while read -r row; do
     e=$(echo "$row" | base64 --decode)
     eid=$(echo "$e" | jq -r '.identifier')
     echo "$e" | jq -r '.yaml' > "$D/environments/$eid.yaml"
-    INF="$(get "ng/api/infrastructures?$QS&environmentIdentifier=$eid&routingId=$ACC&pageSize=1000")"
+    INF="$(paginate_content GET "ng/api/infrastructures?$QS&environmentIdentifier=$eid&routingId=$ACC&pageSize=1000")"
     icount=$(echo "$INF" | jq '.data.content|length')
     if [[ "${icount:-0}" -gt 0 ]]; then
       mkdir -p "$D/environments/$eid.infra"
@@ -127,7 +290,7 @@ for SC in "${SCOPES[@]}"; do
   done
 
   # pipelines (list gives ids; per-id GET gives yamlPipeline)
-  PIP="$(post "pipeline/api/pipelines/list?$QS&routingId=$ACC&pageSize=1000" '{"filterType":"PipelineSetup"}')"
+  PIP="$(paginate_content POST "pipeline/api/pipelines/list?$QS&routingId=$ACC&pageSize=1000" '{"filterType":"PipelineSetup"}')"
   echo "  pipelines:  $(echo "$PIP" | jq '.data.content|length')"
   echo "$PIP" | jq -r '.data.content[].identifier' | while read -r pid; do
     [[ -z "$pid" ]] && continue
@@ -135,7 +298,7 @@ for SC in "${SCOPES[@]}"; do
   done
 
   # templates (versioned)
-  TPL="$(post "template/api/templates/list?$QS&routingId=$ACC&templateListType=All&pageSize=1000" '{"filterType":"Template"}')"
+  TPL="$(paginate_content POST "template/api/templates/list?$QS&routingId=$ACC&templateListType=All&pageSize=1000" '{"filterType":"Template"}')"
   tn=$(echo "$TPL" | jq '(.data.content // []) | length' 2>/dev/null || echo 0)
   echo "  templates:  ${tn:-0}"
   if [[ "${tn:-0}" -gt 0 ]]; then
@@ -145,19 +308,24 @@ for SC in "${SCOPES[@]}"; do
     done
   fi
 
-  # service accounts (recreatable: identifier/name/email/description/tags)
-  SA="$(get "ng/api/serviceaccount?$QS&routingId=$ACC&pageSize=1000")"
-  san=$(echo "$SA" | jq '(.data | if type=="array" then length else (.content|length) end)' 2>/dev/null || echo 0)
+  # service accounts (recreatable: identifier/name/email/description/tags).
+  # This endpoint's response shape is inconsistent (`.data` is sometimes a
+  # raw array, sometimes `{content:[...]}`) — paginate_content's EXTRACT
+  # param normalizes either shape into `.data.content` for the rest of this
+  # block, same as everywhere else.
+  SA="$(paginate_content GET "ng/api/serviceaccount?$QS&routingId=$ACC&pageSize=1000" "" \
+    '(.data | if type=="array" then . else .content end)')"
+  san=$(echo "$SA" | jq '.data.content|length' 2>/dev/null || echo 0)
   echo "  svcaccounts:${san:-0}"
   if [[ "${san:-0}" -gt 0 ]]; then
-    echo "$SA" | jq -c '(.data | if type=="array" then .[] else .content[] end)' | while read -r sa; do
+    echo "$SA" | jq -c '.data.content[]' | while read -r sa; do
       sid=$(echo "$sa" | jq -r '.identifier')
       echo "$sa" | jq '{identifier,name,email,description,tags}' > "$D/serviceaccounts/$sid.json"
     done
   fi
 
   # user groups (custom only; skip harness-managed _all_users etc.)
-  UG="$(get "ng/api/user-groups?$QS&routingId=$ACC&pageSize=1000")"
+  UG="$(paginate_content GET "ng/api/user-groups?$QS&routingId=$ACC&pageSize=1000")"
   ugn=$(echo "$UG" | jq '[.data.content[]? | select(.harnessManaged!=true)] | length' 2>/dev/null || echo 0)
   echo "  usergroups: ${ugn:-0} (custom)"
   if [[ "${ugn:-0}" -gt 0 ]]; then
@@ -170,18 +338,18 @@ for SC in "${SCOPES[@]}"; do
 
   # IACM workspaces (project scope only; path-based route + harness-account header).
   # The list view nulls out repo/variables/connectors, so fetch each by identifier
-  # to capture full config.
+  # to capture full config. iacm_list_workspaces handles this endpoint's own
+  # pagination convention (page/limit, raw array response).
   case "$SC" in
     */*)
       org="${SC%%/*}"; proj="${SC##*/}"
-      WS="$(curl -s -H "authorization: Bearer $TOKEN" -H "harness-account: $ACC" -H 'accept: */*' \
-        "$BASE/iacm/api/orgs/$org/projects/$proj/workspaces?page=1&limit=1000")"
-      wsn=$(echo "$WS" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo 0)
+      WS="$(iacm_list_workspaces "$org" "$proj")"
+      wsn=$(echo "$WS" | jq 'length' 2>/dev/null || echo 0)
       echo "  iacm ws:    ${wsn:-0}"
       if [[ "${wsn:-0}" -gt 0 ]]; then
         echo "$WS" | jq -r '.[].identifier' | while read -r wid; do
           [[ -z "$wid" ]] && continue
-          curl -s -H "authorization: Bearer $TOKEN" -H "harness-account: $ACC" -H 'accept: */*' \
+          curl -s "${AUTH[@]}" -H "harness-account: $ACC" -H 'accept: */*' \
             "$BASE/iacm/api/orgs/$org/projects/$proj/workspaces/$wid" \
             | jq '.' > "$D/iacm-workspaces/$wid.json"
         done
@@ -194,13 +362,93 @@ for SC in "${SCOPES[@]}"; do
   # these entries, and all observed files are Harness-auto-seeded sample K8s
   # manifests (deployment/namespace/service/values.yaml) that every account gets
   # for free — so the target already has them. Capture structure for reference.
-  FS="$(get "ng/api/file-store?$QS&routingId=$ACC&pageSize=1000")"
+  FS="$(paginate_content GET "ng/api/file-store?$QS&routingId=$ACC&pageSize=1000")"
   fcount=$(echo "$FS" | jq '(.data.content // []) | length' 2>/dev/null || echo 0)
   echo "  filestore:  ${fcount:-0} (manifest only; sample files, not replicated)"
   if [[ "${fcount:-0}" -gt 0 ]]; then
     echo "$FS" | jq '[.data.content[]|{identifier,name,type,parentIdentifier,mimeType,fileUsage,description}]' > "$D/filestore/_manifest.json"
   fi
 done
+
+# --- project mode: pull in account-/org-scoped dependencies -----------------
+# The project's own resources can reference secrets/connectors defined one
+# scope up (e.g. connectorRef: account.foo, provider_connector: org.bar).
+# Project mode otherwise never touches account/org scope, so a fresh target
+# won't have these yet and import fails with "No secret/connector exists
+# with the id X". Best-effort: scan every exported JSON/YAML file's actual
+# string VALUES (not a raw text grep — avoids false positives from a URL or
+# path that merely contains "account." or "org." as a substring) for values
+# matching exactly "<prefix>.<identifier>", then try each as a secret, then
+# a connector, at that scope. Harness built-ins, and anything that resolves
+# to neither (e.g. a user-group reference, or a Harness-native
+# repository/template reference this tool doesn't migrate), are skipped
+# with a note rather than failing the export.
+if [[ "$PROJECT_MODE" -eq 1 ]]; then
+  echo
+  echo "Scanning $SRC_ORG/$SRC_PROJECT's exported resources for account-/org-scoped dependencies..."
+  DEPD="$OUT/$(scope_dir "$SRC_ORG/$SRC_PROJECT")"
+  DEP_BUILTINS="harnessSecretManager harnessImage"
+
+  # detect_scoped_refs DIR PREFIX -> deduped bare identifiers referenced as
+  # "<prefix>.<id>" anywhere inside DIR's JSON/YAML files.
+  detect_scoped_refs() {
+    local dir="$1" prefix="$2" f
+    {
+      while IFS= read -r f; do
+        jq -r --arg p "$prefix" '[.. | strings | select(test("^" + $p + "\\.[A-Za-z0-9_-]+$"))] | .[]' "$f" 2>/dev/null
+      done < <(find "$dir" -name '*.json' 2>/dev/null)
+      while IFS= read -r f; do
+        yq -o=json "$f" 2>/dev/null | jq -r --arg p "$prefix" '[.. | strings | select(test("^" + $p + "\\.[A-Za-z0-9_-]+$"))] | .[]' 2>/dev/null
+      done < <(find "$dir" \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)
+    } | sed "s/^${prefix}\.//" | sort -u
+  }
+
+  # resolve_dependency PREFIX ID SCOPE_QS OUTDIR HEADER
+  #   Try ID as a secret, then as a connector, at the given scope.
+  resolve_dependency() {
+    local prefix="$1" id="$2" sqs="$3" outdir="$4" header="$5"
+    case " $DEP_BUILTINS " in *" $id "*) echo "    skip $prefix.$id (Harness built-in)"; return;; esac
+    local sec; sec="$(get "ng/api/v2/secrets/$id?$sqs&routingId=$ACC")"
+    if echo "$sec" | jq -e '.data.secret' >/dev/null 2>&1; then
+      local stype sname
+      stype="$(echo "$sec" | jq -r '.data.secret.type')"
+      sname="$(echo "$sec" | jq -r '.data.secret.name // "-"')"
+      if ! grep -qF "## Scope: $header" "$SECMAN" 2>/dev/null; then
+        { echo "## Scope: $header"; echo; } >> "$SECMAN"
+      fi
+      echo "- [ ] \`$id\`  (type: $stype, name: $sname)" >> "$SECMAN"
+      echo "    dependency $prefix.$id -> secret (added to manifest, scope: $header)"
+      return
+    fi
+    local conn; conn="$(get "ng/api/connectors/$id?$sqs&routingId=$ACC")"
+    if echo "$conn" | jq -e '.data.connector' >/dev/null 2>&1; then
+      mkdir -p "$outdir/connectors"
+      echo "$conn" | jq '.data.connector' > "$outdir/connectors/$id.json"
+      echo "    dependency $prefix.$id -> connector (exported to $outdir/connectors/$id.json)"
+      return
+    fi
+    echo "    dependency $prefix.$id -> NOT FOUND as a secret or connector at scope '$header' (skipped — might be a user group, template, or Harness-native repository reference this tool doesn't migrate)"
+  }
+
+  ACCT_REFS="$(detect_scoped_refs "$DEPD" account)"
+  if [[ -n "$ACCT_REFS" ]]; then
+    mkdir -p "$OUT/account"
+    while IFS= read -r id; do
+      [[ -z "$id" ]] && continue
+      resolve_dependency account "$id" "accountIdentifier=$ACC" "$OUT/account" "account"
+    done <<< "$ACCT_REFS"
+  fi
+
+  ORG_REFS="$(detect_scoped_refs "$DEPD" org)"
+  if [[ -n "$ORG_REFS" ]]; then
+    ORGDIR="$OUT/$(scope_dir "org:$SRC_ORG")"
+    mkdir -p "$ORGDIR"
+    while IFS= read -r id; do
+      [[ -z "$id" ]] && continue
+      resolve_dependency org "$id" "accountIdentifier=$ACC&orgIdentifier=$SRC_ORG" "$ORGDIR" "org:$SRC_ORG"
+    done <<< "$ORG_REFS"
+  fi
+fi
 
 echo
 echo "Export complete -> $OUT"

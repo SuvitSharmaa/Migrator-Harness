@@ -2,22 +2,39 @@
 #
 # import.sh — Replay an export produced by export.sh into a TARGET Harness account.
 #
-# Default target is app.harness.io (prod). Mirrors the source structure exactly:
-# recreates projects under org "default", then upserts every entity into its
-# original scope (account / default/KarpoInfra / default/Alice).
+# Default target is app.harness.io (prod). Discovers which scope directories
+# the export actually contains — "account", "org-scope__<org>" (org-only —
+# see below), or "<org>__<project>" — recreates each project, then upserts
+# every entity into its scope. By default the target scope mirrors the
+# source identifiers exactly; set TGT_ORG/TGT_PROJECT to redirect a
+# single-project export into a differently-named target project. Account-
+# scope entries stay at the TARGET account's account scope (not remapped);
+# org-scope entries move to org "org:$TGT_ORG" (the project's own target org).
 #
-# Dependency order: orgs(exist) -> projects -> connectors -> service accounts ->
-# user groups -> services -> environments -> infrastructures -> pipelines.
-# Every entity is UPSERTed (create; on "already exists" fall back to update).
+# Dependency order: orgs(exist) -> projects -> templates -> connectors ->
+# service accounts -> user groups -> services -> environments ->
+# infrastructures -> pipelines. Every entity is UPSERTed (create; on
+# "already exists" fall back to update).
 #
 # NOT imported (by design):
 #   - secrets       : values can't be exported; see harness-export/secrets-manifest.md
 #   - file store    : source entries are Harness auto-seeded sample manifests
 #   - role bindings : principals (users) don't exist identically in the target
+#   - Harness-native "repository" objects (e.g. IACM's Terraform module repos)
+#     and resources outside these entity types (e.g. Monitored Services) —
+#     out of scope; a handful of IACM workspaces/pipelines may still need
+#     manual follow-up if they depend on these.
 #
 # Usage:
 #   HARNESS_TOKEN=<target-token> TGT_ACCOUNT_ID=<acct> ./import.sh            # apply
 #   HARNESS_TOKEN=<target-token> TGT_ACCOUNT_ID=<acct> DRY_RUN=1 ./import.sh  # preview
+#
+#   # project mode: import a single-project export (produced by
+#   # `export.sh` with SRC_ORG/SRC_PROJECT set) into a specific target
+#   # org/project — which may use a different identifier than the source:
+#   HARNESS_TOKEN=<target-token> TGT_ACCOUNT_ID=<acct> \
+#     TGT_ORG=default TGT_PROJECT=AliceCopy [TGT_PROJECT_NAME="Alice Copy"] \
+#     ./import.sh
 #
 set -uo pipefail
 
@@ -26,6 +43,16 @@ ACC="${TGT_ACCOUNT_ID:?set TGT_ACCOUNT_ID to the target account identifier}"
 BASE="${TGT_BASE_URL:-https://machine-pulse.harness.io}"
 IN="${IN_DIR:-./harness-export}"
 DRY="${DRY_RUN:-0}"
+TGT_ORG="${TGT_ORG:-}"
+TGT_PROJECT="${TGT_PROJECT:-}"
+TGT_PROJECT_NAME="${TGT_PROJECT_NAME:-}"
+
+if [[ -n "$TGT_ORG" && -z "$TGT_PROJECT" ]] || [[ -z "$TGT_ORG" && -n "$TGT_PROJECT" ]]; then
+  echo "set both TGT_ORG and TGT_PROJECT for a project-scoped import, or leave both unset to mirror the export's own org/project identifiers" >&2
+  exit 1
+fi
+PROJECT_MODE=0
+[[ -n "$TGT_ORG" && -n "$TGT_PROJECT" ]] && PROJECT_MODE=1
 
 # Auth header: a real API key uses x-api-key; a UI JWT uses Authorization: Bearer.
 # Token starting with "pat." or "sat." => API key; else treat as bearer.
@@ -51,13 +78,24 @@ declare -a FAILED
 scope_qs() {
   case "$1" in
     account) echo "accountIdentifier=$ACC" ;;
+    org:*)   echo "accountIdentifier=$ACC&orgIdentifier=${1#org:}" ;;
     */*)     echo "accountIdentifier=$ACC&orgIdentifier=${1%%/*}&projectIdentifier=${1##*/}" ;;
   esac
 }
-scope_of_dir() { # account__ -> account ; org__proj -> org/proj
+scope_of_dir() { # account -> account ; org-scope__X -> org:X ; org__proj -> org/proj
   local d="$1"
   [[ "$d" == account ]] && { echo account; return; }
+  case "$d" in org-scope__*) echo "org:${d#org-scope__}"; return ;; esac
   echo "${d%%__*}/${d#*__}"
+}
+# split_org_proj SCOPE -> echoes "ORG PROJ" (PROJ empty for account/org-only scopes)
+split_org_proj() {
+  case "$1" in
+    account) echo " " ;;
+    org:*)   echo "${1#org:} " ;;
+    */*)     echo "${1%%/*} ${1#*/}" ;;
+    *)       echo " " ;;
+  esac
 }
 
 # req METHOD URL CONTENTTYPE BODY LABEL
@@ -88,10 +126,9 @@ req() {
 upsert_json() {
   local path="$1" sc="$2" wrap="$3" file="$4" label="$5"
   local qs; qs="$(scope_qs "$sc")"
-  local org="" proj=""
-  case "$sc" in */*) org="${sc%%/*}"; proj="${sc#*/}";; esac
+  local org="" proj=""; read -r org proj <<< "$(split_org_proj "$sc")"
   local inner; inner="$(jq --arg a "$ACC" --arg o "$org" --arg p "$proj" \
-    '. + {accountIdentifier:$a} + (if $o=="" then {} else {orgIdentifier:$o,projectIdentifier:$p} end)' "$file")"
+    '. + {accountIdentifier:$a} + (if $o=="" then {} else {orgIdentifier:$o} + (if $p=="" then {} else {projectIdentifier:$p} end) end)' "$file")"
   local payload; if [[ -n "$wrap" ]]; then payload="$(jq -n --argjson v "$inner" "{\"$wrap\":\$v}")"; else payload="$inner"; fi
 
   req POST "$BASE/$path?$qs&routingId=$ACC" json "$payload" "$label"
@@ -104,9 +141,9 @@ upsert_json() {
 upsert_json_pathid() {
   local path="$1" sc="$2" wrap="$3" file="$4" label="$5" id="$6"
   local qs; qs="$(scope_qs "$sc")"
-  local org="" proj=""; case "$sc" in */*) org="${sc%%/*}"; proj="${sc#*/}";; esac
+  local org="" proj=""; read -r org proj <<< "$(split_org_proj "$sc")"
   local inner; inner="$(jq --arg a "$ACC" --arg o "$org" --arg p "$proj" \
-    '. + {accountIdentifier:$a} + (if $o=="" then {} else {orgIdentifier:$o,projectIdentifier:$p} end)' "$file")"
+    '. + {accountIdentifier:$a} + (if $o=="" then {} else {orgIdentifier:$o} + (if $p=="" then {} else {projectIdentifier:$p} end) end)' "$file")"
   local payload; if [[ -n "$wrap" ]]; then payload="$(jq -n --argjson v "$inner" "{\"$wrap\":\$v}")"; else payload="$inner"; fi
 
   req POST "$BASE/$path?$qs&routingId=$ACC" json "$payload" "$label"
@@ -116,6 +153,39 @@ upsert_json_pathid() {
 # yaml_get FILE JSONPATH  -> extract a scalar from the entity YAML via yq
 yaml_get() { yq -r "$2" "$1" 2>/dev/null; }
 
+# rewrite_scope_yaml FILE ROOTKEY ORG PROJ
+#   The exported YAML bodies for services/environments/infrastructures/pipelines
+#   all embed their OWN top-level orgIdentifier/projectIdentifier fields. In
+#   project mode (target org/project != source), that embedded value still
+#   says the SOURCE scope even though the DTO wrapper / URL now say target —
+#   and environmentsV2/infrastructures/pipelines all reject that mismatch with
+#   a 400. Rewrite the embedded fields to the target scope before sending.
+#
+#   For pipelines specifically, also rewrite cross-pipeline "chained pipeline"
+#   stage references: a `type: Pipeline` stage's spec is {org, project,
+#   pipeline, inputs, ...} naming another pipeline by org/project/identifier.
+#   That's validated at create time too, and turned out to be the actual
+#   cause of "Invalid scope parameters" 400s (not the top-level fields alone)
+#   — every pipeline that has one of these stages failed, every pipeline
+#   without one imported fine even before this fix. The `has("pipeline") and
+#   has("org") and has("project")` guard targets only that specific stage
+#   shape so unrelated fields (e.g. a step's own "project"/"org"-named input)
+#   are left untouched — verified against this export's real pipelines.
+#
+#   ORG=="" means account scope (nothing to rewrite); yq failure falls back to
+#   the original file untouched rather than silently dropping content.
+rewrite_scope_yaml() {
+  local file="$1" root="$2" org="$3" proj="$4" out expr
+  if [[ -z "$org" ]]; then cat "$file"; return; fi
+  expr=".${root}.orgIdentifier = strenv(TARGET_ORG)"
+  [[ -n "$proj" ]] && expr="$expr | .${root}.projectIdentifier = strenv(TARGET_PROJ)"
+  if [[ "$root" == "pipeline" ]]; then
+    expr="$expr | (.. | select(tag == \"!!map\" and has(\"pipeline\") and has(\"org\") and has(\"project\"))) |= (.org = strenv(TARGET_ORG) | .project = strenv(TARGET_PROJ))"
+  fi
+  out="$(TARGET_ORG="$org" TARGET_PROJ="$proj" yq "$expr" "$file" 2>/dev/null)"
+  if [[ -z "$out" ]]; then cat "$file"; else printf '%s\n' "$out"; fi
+}
+
 # upsert_dto BASEPATH SCOPE ROOTKEY FILE LABEL [EXTRA_QS]
 #   services/environments/infrastructures take a JSON DTO (application/json):
 #   top-level identifier/name/scope fields + the full entity YAML as a string
@@ -124,13 +194,13 @@ yaml_get() { yq -r "$2" "$1" 2>/dev/null; }
 upsert_dto() {
   local path="$1" sc="$2" root="$3" file="$4" label="$5" extra="${6:-}"
   local qs; qs="$(scope_qs "$sc")"
-  local org="" proj=""; case "$sc" in */*) org="${sc%%/*}"; proj="${sc#*/}";; esac
+  local org="" proj=""; read -r org proj <<< "$(split_org_proj "$sc")"
 
   local id name etype yaml
   id="$(yaml_get "$file" ".${root}.identifier")"
   name="$(yaml_get "$file" ".${root}.name")"
   etype="$(yaml_get "$file" ".${root}.type")"   # only environments use this; null otherwise
-  yaml="$(cat "$file")"
+  yaml="$(rewrite_scope_yaml "$file" "$root" "$org" "$proj")"
 
   # Build DTO. environmentsV2 wants `type`; services/infra ignore a null one.
   local dto
@@ -139,7 +209,7 @@ upsert_dto() {
     --arg org "$org" --arg proj "$proj" --arg etype "$etype" \
     --arg yaml "$yaml" --arg root "$root" '
       {identifier:$id, name:$name, accountIdentifier:$acct, yaml:$yaml}
-      + (if $org!="" then {orgIdentifier:$org, projectIdentifier:$proj} else {} end)
+      + (if $org=="" then {} else {orgIdentifier:$org} + (if $proj=="" then {} else {projectIdentifier:$proj} end) end)
       + (if $root=="environment" and $etype!="null" and $etype!="" then {type:$etype} else {} end)
     ')"
 
@@ -189,22 +259,82 @@ upsert_iacm_workspace() {
 
 echo "=== Importing $IN -> account $ACC @ $BASE  (DRY_RUN=$DRY) ==="
 
+# ---- 0. discover which scope directories this export actually produced -----
+# (dynamic — works for any org/project names, not just the original migration's)
+# Three possible shapes: "account", "org-scope__<org>" (org-only — holds
+# account-/org-scoped dependencies a project-mode export pulled in because the
+# project's own resources referenced them), and "<org>__<project>".
+SCDIRS=()
+[[ -d "$IN/account" ]] && SCDIRS+=(account)
+while IFS= read -r d; do
+  SCDIRS+=("$(basename "$d")")
+done < <(find "$IN" -maxdepth 1 -type d -name '*__*' | sort)
+
+if [[ "$PROJECT_MODE" -eq 1 ]]; then
+  PROJDIRS=(); OTHERDIRS=()
+  for d in "${SCDIRS[@]}"; do
+    case "$d" in
+      account|org-scope__*) OTHERDIRS+=("$d") ;;
+      *) PROJDIRS+=("$d") ;;
+    esac
+  done
+  if [[ "${#PROJDIRS[@]}" -ne 1 ]]; then
+    echo "TGT_ORG/TGT_PROJECT set but '$IN' contains ${#PROJDIRS[@]} project scope(s) (${PROJDIRS[*]:-none}) — project-mode import expects exactly one (re-export with SRC_ORG/SRC_PROJECT set)" >&2
+    exit 1
+  fi
+  SCDIRS=("${OTHERDIRS[@]}" "${PROJDIRS[@]}")
+  echo "project mode: ${PROJDIRS[0]} -> $TGT_ORG/$TGT_PROJECT${OTHERDIRS[*]:+ (plus referenced account-/org-scope dependencies: ${OTHERDIRS[*]})}"
+fi
+echo "Scope dirs: ${SCDIRS[*]}"
+
 # ---- 1. projects (org 'default' assumed to exist) --------------------------
 echo "== projects =="
 if [[ -f "$IN/scope.json" ]]; then
   jq -c '.projects[]' "$IN/scope.json" | while read -r p; do
-    pid=$(echo "$p" | jq -r '.identifier'); org=$(echo "$p" | jq -r '.orgIdentifier')
-    payload=$(echo "$p" | jq --arg a "$ACC" '{project: (. + {accountIdentifier:$a})}')
+    src_pid=$(echo "$p" | jq -r '.identifier'); src_org=$(echo "$p" | jq -r '.orgIdentifier')
+    if [[ "$PROJECT_MODE" -eq 1 ]]; then
+      org="$TGT_ORG"; pid="$TGT_PROJECT"
+      name="${TGT_PROJECT_NAME:-$(echo "$p" | jq -r '.name')}"
+      payload=$(echo "$p" | jq --arg a "$ACC" --arg org "$org" --arg pid "$pid" --arg name "$name" \
+        '(. + {accountIdentifier:$a, orgIdentifier:$org, identifier:$pid, name:$name}) | {project: .}')
+    else
+      org="$src_org"; pid="$src_pid"
+      payload=$(echo "$p" | jq --arg a "$ACC" '{project: (. + {accountIdentifier:$a})}')
+    fi
     req POST "$BASE/ng/api/projects?accountIdentifier=$ACC&orgIdentifier=$org&routingId=$ACC" json "$payload" "project/$org/$pid"
     [[ $? -eq 9 ]] && req PUT "$BASE/ng/api/projects/$pid?accountIdentifier=$ACC&orgIdentifier=$org&routingId=$ACC" json "$payload" "project/$org/$pid (update)"
   done
 fi
 
 # ---- per-scope entities ----------------------------------------------------
-for SCDIR in account default__KarpoInfra default__Alice; do
-  [[ -d "$IN/$SCDIR" ]] || continue
-  SC="$(scope_of_dir "$SCDIR")"
-  echo "== scope: $SC =="
+for SCDIR in "${SCDIRS[@]}"; do
+  SRC_SC="$(scope_of_dir "$SCDIR")"
+  if [[ "$PROJECT_MODE" -eq 1 ]]; then
+    case "$SRC_SC" in
+      account) SC="account" ;;
+      org:*)   SC="org:$TGT_ORG" ;;
+      *)       SC="$TGT_ORG/$TGT_PROJECT" ;;
+    esac
+  else
+    SC="$SRC_SC"
+  fi
+  echo "== scope: $SRC_SC -> $SC =="
+
+  # templates (raw YAML, root key "template") — created before connectors,
+  # since a connector (e.g. a template-based CustomSecretManager) can
+  # reference one. A template's identity is identifier+versionLabel; the
+  # update endpoint can't change versionLabel, so re-running with the same
+  # exported version just updates that version's content.
+  for f in "$IN/$SCDIR"/templates/*.yaml; do [[ -e "$f" ]] || continue
+    torg="" tproj=""; read -r torg tproj <<< "$(split_org_proj "$SC")"
+    tqs="$(scope_qs "$SC")"
+    tid="$(yaml_get "$f" ".template.identifier")"
+    tver="$(yaml_get "$f" ".template.versionLabel")"
+    [[ -z "$tid" || "$tid" == "null" ]] && continue
+    tbody="$(rewrite_scope_yaml "$f" "template" "$torg" "$tproj")"
+    req POST "$BASE/template/api/templates?$tqs&routingId=$ACC" yaml "$tbody" "template/$tid/$tver"
+    [[ $? -eq 9 ]] && req PUT "$BASE/template/api/templates/update/$tid/$tver?$tqs&routingId=$ACC" yaml "$tbody" "template/$tid/$tver (update)"
+  done
 
   # connectors (JSON, wrap "connector") — skip Harness built-ins
   for f in "$IN/$SCDIR"/connectors/*.json; do [[ -e "$f" ]] || continue
@@ -238,10 +368,15 @@ for SCDIR in account default__KarpoInfra default__Alice; do
     done
   done
 
-  # pipelines (YAML) — v2 create endpoint consumes raw pipeline YAML
+  # pipelines (YAML) — v2 create endpoint consumes raw pipeline YAML. Pipeline
+  # YAML also embeds its own top-level orgIdentifier/projectIdentifier (same
+  # issue as environments/infra above) — rewrite before sending.
   for f in "$IN/$SCDIR"/pipelines/*.yaml; do [[ -e "$f" ]] || continue
-    case "$SC" in */*) qs="$(scope_qs "$SC")";; *) echo "    SKIP pipeline (account-scope pipelines unsupported)"; SKIP=$((SKIP+1)); continue;; esac
-    body="$(cat "$f")"; pid="$(basename "$f" .yaml)"
+    case "$SC" in
+      */*) porg="${SC%%/*}"; pproj="${SC#*/}"; qs="$(scope_qs "$SC")" ;;
+      *) echo "    SKIP pipeline (account-scope pipelines unsupported)"; SKIP=$((SKIP+1)); continue ;;
+    esac
+    body="$(rewrite_scope_yaml "$f" "pipeline" "$porg" "$pproj")"; pid="$(basename "$f" .yaml)"
     req POST "$BASE/pipeline/api/pipelines/v2?$qs&routingId=$ACC" yaml "$body" "pipeline/$pid"
     [[ $? -eq 9 ]] && req PUT "$BASE/pipeline/api/pipelines/v2/$pid?$qs&routingId=$ACC" yaml "$body" "pipeline/$pid (update)"
   done
