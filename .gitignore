@@ -1,0 +1,4 @@
+# Per CXE Deep Dive guide: never commit MCP config with real account IDs or PATs
+.mcp.json
+.env
+.claude/settings.local.json

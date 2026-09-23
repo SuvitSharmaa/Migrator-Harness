@@ -1,0 +1,62 @@
+{
+  "created": 1778486082451,
+  "description": "Harness IaCM workspace for environments/staging",
+  "name": "iacm-staging",
+  "account": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "org": "default",
+  "project": "KarpoInfra",
+  "identifier": "iacm_staging",
+  "updated": 1778486082451,
+  "provisioner": "terraform",
+  "provisioner_version": "1.5.7",
+  "provisioner_data": {
+    "cost_breakdown": "1f2bd184-7ea4-4856-981f-02ba9b698373",
+    "cost_diff": "65b84044-c4c4-4970-8f20-6c8ba47ea584",
+    "modules": "767e01e0-43f4-4626-a422-70f19f3ef9b8",
+    "plan_human": "445f0408-9df5-43a3-a6a9-f01e5c4893f3",
+    "plan_raw": "",
+    "providers": "",
+    "state_human": "8286b4b8-18e6-443c-a2fb-9b03292bf16f",
+    "state_raw": "965590a6-8fa0-46dc-9dc2-3be55216e280"
+  },
+  "terraform_plan_json": "445f0408-9df5-43a3-a6a9-f01e5c4893f3",
+  "terraform_state": "965590a6-8fa0-46dc-9dc2-3be55216e280",
+  "terraform_state_json": "8286b4b8-18e6-443c-a2fb-9b03292bf16f",
+  "provider_connector": "aws_karpo_iacm",
+  "repository": "karpo-infra",
+  "repository_branch": "main",
+  "repository_connector": "MPHarness",
+  "repository_path": "environments/staging",
+  "repository_submodules": "false",
+  "status": "active",
+  "cost_breakdown_json": "1f2bd184-7ea4-4856-981f-02ba9b698373",
+  "cost_diff_json": "65b84044-c4c4-4970-8f20-6c8ba47ea584",
+  "modules_json": "767e01e0-43f4-4626-a422-70f19f3ef9b8",
+  "providers_json": "",
+  "cost_estimation_enabled": true,
+  "terraform_variables": null,
+  "environment_variables": null,
+  "terraform_variable_files": null,
+  "budget": null,
+  "backend_locked": false,
+  "default_pipelines": {
+    "plan": {
+      "project_pipeline": "karpo_infra"
+    }
+  },
+  "state_checksum": "c545897543087adaf73a2be745cca944570f7165112651925a68ad6691922b77",
+  "variable_sets": null,
+  "tags": {
+    "iacm": "",
+    "workspace": "staging"
+  },
+  "provider_connectors": [
+    {
+      "connector_ref": "aws_karpo_iacm",
+      "type": "aws",
+      "created": 1778486082451,
+      "updated": 1778486082451
+    }
+  ],
+  "prune_sensitive_data": false
+}

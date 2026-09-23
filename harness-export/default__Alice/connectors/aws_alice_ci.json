@@ -1,0 +1,26 @@
+{
+  "name": "aws-alice-ci",
+  "identifier": "aws_alice_ci",
+  "description": "AWS connector for Harness CD — assumes alice-harness-ci for ECR read.",
+  "accountIdentifier": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "orgIdentifier": "default",
+  "projectIdentifier": "Alice",
+  "tags": {},
+  "type": "Aws",
+  "spec": {
+    "credential": {
+      "crossAccountAccess": null,
+      "type": "OidcAuthentication",
+      "spec": {
+        "iamRoleArn": "arn:aws:iam::651527661132:role/alice-harness-ci",
+        "oidcSessionTagKeys": null
+      },
+      "region": "ap-southeast-1"
+    },
+    "awsSdkClientBackOffStrategyOverride": null,
+    "delegateSelectors": [],
+    "executeOnDelegate": false,
+    "proxy": false,
+    "ignoreTestConnection": false
+  }
+}

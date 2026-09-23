@@ -1,0 +1,1786 @@
+pipeline:
+  name: alice-prod-deploy
+  identifier: alice_prod_deploy
+  orgIdentifier: default
+  projectIdentifier: Alice
+  tags:
+    cd: ""
+
+  variables:
+    - name: image_tag
+      type: String
+      description: "ECR image tag to deploy (alice-api). The prod web frontend is promoted from Vercel staged Production by this pipeline."
+      required: true
+      value: <+input>
+    - name: commit_sha
+      type: String
+      description: "Full Git commit SHA for the same build. Used to find the matching staged Vercel Production deployment."
+      required: false
+      value: ""
+
+  stages:
+
+    # =====================================================================
+    # Stage 0a — Safely migrate the (shared) DB on staging.
+    #
+    # Runs BEFORE Deploy Staging because the new binary's /readyz checks
+    # whether the DB is at the migration version the binary expects.
+    # Staging shares the prod DB, so this migration advances PROD's
+    # schema before the human Approval Gate. safe-up blocks
+    # destructive/non-additive SQL such as DROP, TRUNCATE, UPDATE/DELETE
+    # backfills, renames, and column tightening.
+    #
+    # Three steps:
+    #   1. Detect  — read-only `./migrate check` reports whether any
+    #      pending migration is destructive (no SQL applied).
+    #   2. Approve — a HarnessApproval that ONLY runs when step 1 found a
+    #      destructive migration. Additive releases (the common case)
+    #      skip it entirely and keep the fast auto-migrate path. Because
+    #      the shared DB is prod's, this is the gate before destructive
+    #      SQL touches prod data.
+    #   3. Apply   — always safe-up, but with the approved versions passed
+    #      via ALICE_MIGRATE_SAFE_UP_ALLOW_UNSAFE_VERSIONS. The allowlist
+    #      is exactly what the approver saw; any OTHER unsafe migration
+    #      still hard-fails. Empty when nothing destructive was detected.
+    #
+    # The prod Migrate stage downstream becomes a no-op for a successful
+    # run (migrate up is idempotent), kept as a safety net for a
+    # fresh-prod-only deploy where staging never ran.
+    #
+    # failureStrategies: MarkAsFailure — if the migration breaks or the
+    # approval is rejected, no staging deploy, no prod migrate. The shared
+    # DB might be left at a partial state; that's the same risk surface
+    # as prod Migrate today.
+    # =====================================================================
+    - stage:
+        name: Migrate Staging
+        identifier: migrate_staging
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          execution:
+            steps:
+              # Step 1 — Detect. Read-only `./migrate check` Job reports whether
+              # any PENDING migration is destructive, without applying anything.
+              # Its stdout sentinels (MIGRATE_CHECK_UNSAFE / _VERSIONS) become
+              # this step's output variables, which gate the approval below and
+              # become the safe-up allowlist after approval. Detection reuses the
+              # exact same unsafeMigrationReason logic safe-up enforces, so the
+              # gate can never disagree with the executor.
+              - step:
+                  name: Detect Unsafe Migrations
+                  identifier: detect_unsafe_migrations
+                  type: ShellScript
+                  timeout: 10m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          NS=alice-staging
+                          IMAGE_TAG='<+pipeline.variables.image_tag>'
+                          IMAGE="651527661132.dkr.ecr.ap-southeast-1.amazonaws.com/alice-api:${IMAGE_TAG}"
+
+                          echo "→ removing any prior alice-migrate-check Job"
+                          kubectl -n "$NS" delete job alice-migrate-check --ignore-not-found --wait=true
+
+                          # Read-only dry run — `check` connects, scans the
+                          # pending up-migrations, prints the sentinels, and
+                          # ALWAYS exits 0 on a clean scan. It never applies SQL.
+                          cat <<EOF | kubectl -n "$NS" apply -f -
+                          apiVersion: batch/v1
+                          kind: Job
+                          metadata:
+                            name: alice-migrate-check
+                            labels:
+                              app.kubernetes.io/name: alice-migrate-check
+                              app.kubernetes.io/part-of: alice
+                          spec:
+                            backoffLimit: 0
+                            ttlSecondsAfterFinished: 3600
+                            activeDeadlineSeconds: 300
+                            template:
+                              spec:
+                                restartPolicy: Never
+                                serviceAccountName: alice-api
+                                containers:
+                                  - name: migrate-check
+                                    image: ${IMAGE}
+                                    imagePullPolicy: IfNotPresent
+                                    command: ["./migrate"]
+                                    args: ["check"]
+                                    envFrom:
+                                      - configMapRef:
+                                          name: alice-api-env
+                                      - secretRef:
+                                          name: alice-api-secrets
+                                    resources:
+                                      requests: { cpu: "250m", memory: "256Mi" }
+                                      limits:   { cpu: "1000m", memory: "512Mi" }
+                          EOF
+
+                          echo "→ waiting for check to finish (up to 5 min)"
+                          SECONDS=0
+                          LOG=""
+                          while [ $SECONDS -lt 300 ]; do
+                            if kubectl -n "$NS" get job alice-migrate-check \
+                                -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null \
+                                | grep -q True; then
+                              LOG=$(kubectl -n "$NS" logs job/alice-migrate-check --tail=500 || true)
+                              break
+                            fi
+                            if kubectl -n "$NS" get job alice-migrate-check \
+                                -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null \
+                                | grep -q True; then
+                              echo "✗ migration check job failed — pod logs:"
+                              kubectl -n "$NS" logs -l job-name=alice-migrate-check --tail=200 || true
+                              exit 1
+                            fi
+                            sleep 5
+                          done
+
+                          if [ -z "$LOG" ]; then
+                            echo "✗ migration check did not finish within 5 min"
+                            kubectl -n "$NS" describe job alice-migrate-check | tail -30 || true
+                            exit 1
+                          fi
+
+                          echo "$LOG"
+
+                          # `|| true` on every extraction: under `set -euo
+                          # pipefail` a non-matching grep would abort the step
+                          # before the fail-safe defaults below. UNSAFE_MIGRATION
+                          # lines are absent on additive releases (the fast
+                          # path), so its grep MUST tolerate no match.
+                          HAS_UNSAFE=$(echo "$LOG" | grep -oE 'MIGRATE_CHECK_UNSAFE=(true|false)' | tail -1 | cut -d= -f2 || true)
+                          UNSAFE_VERSIONS=$(echo "$LOG" | grep 'MIGRATE_CHECK_UNSAFE_VERSIONS=' | tail -1 | sed 's/.*MIGRATE_CHECK_UNSAFE_VERSIONS=//' || true)
+                          # Human-readable list for the approval card. Neutralize
+                          # any "<+" so Harness never evaluates migration text as
+                          # an expression.
+                          UNSAFE_SUMMARY=$(echo "$LOG" | grep 'UNSAFE_MIGRATION ' | sed 's/<+/< +/g' | awk 'BEGIN{ORS=" | "}{print}' || true)
+
+                          # Fail safe: an unparseable sentinel on a Completed job
+                          # is treated as "no allowlist". safe-up below is the
+                          # backstop — it hard-fails on any unsafe migration that
+                          # is not explicitly allowlisted.
+                          [ -z "${HAS_UNSAFE:-}" ] && HAS_UNSAFE=false
+                          [ "$UNSAFE_VERSIONS" = "null" ] && UNSAFE_VERSIONS=""
+
+                          echo "HAS_UNSAFE=$HAS_UNSAFE"
+                          echo "UNSAFE_VERSIONS=$UNSAFE_VERSIONS"
+                          export HAS_UNSAFE UNSAFE_VERSIONS UNSAFE_SUMMARY
+                    outputVariables:
+                      - name: HAS_UNSAFE
+                        type: String
+                        value: HAS_UNSAFE
+                      - name: UNSAFE_VERSIONS
+                        type: String
+                        value: UNSAFE_VERSIONS
+                      - name: UNSAFE_SUMMARY
+                        type: String
+                        value: UNSAFE_SUMMARY
+
+              # Step 2 — Approval, only when a destructive migration was detected.
+              # Skipped entirely for additive releases (the common case), so the
+              # fast path is unchanged. Staging applies to the SHARED prod DB, so
+              # this is the gate before destructive SQL touches prod data. Same
+              # 72h window and approver groups as the prod deploy gate.
+              - step:
+                  name: Approve Unsafe Migration
+                  identifier: approve_unsafe_migration
+                  type: HarnessApproval
+                  timeout: 72h
+                  when:
+                    stageStatus: Success
+                    condition: <+pipeline.stages.migrate_staging.spec.execution.steps.detect_unsafe_migrations.output.outputVariables.HAS_UNSAFE> == "true"
+                  spec:
+                    approvalMessage: |
+                      **DESTRUCTIVE MIGRATION DETECTED.** Staging migrates the SHARED prod database, so approving applies this SQL to prod data now.
+
+                      Pending migrations blocked by `safe-up`:
+
+                      `<+pipeline.stages.migrate_staging.spec.execution.steps.detect_unsafe_migrations.output.outputVariables.UNSAFE_VERSIONS>`
+
+                      <+pipeline.stages.migrate_staging.spec.execution.steps.detect_unsafe_migrations.output.outputVariables.UNSAFE_SUMMARY>
+
+                      **Image:** `<+pipeline.variables.image_tag>`
+
+                      Approving allowlists ONLY the versions listed above. Any other unsafe migration still hard-fails.
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                      userGroups:
+                        - _project_all_users
+                        - account._account_all_users
+                    isAutoRejectEnabled: false
+
+              # Step 3 — Apply. Always runs safe-up; the allowlist is exactly the
+              # versions a human approved above (empty when nothing unsafe was
+              # detected, in which case safe-up runs in strict default mode).
+              - step:
+                  name: Run Migrations Staging
+                  identifier: run_migrations_staging
+                  type: ShellScript
+                  timeout: 15m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          NS=alice-staging
+                          IMAGE_TAG='<+pipeline.variables.image_tag>'
+                          IMAGE="651527661132.dkr.ecr.ap-southeast-1.amazonaws.com/alice-api:${IMAGE_TAG}"
+
+                          # Only what the gate above approved. When no unsafe
+                          # migration was detected this resolves to empty and
+                          # safe-up runs in its strict default mode.
+                          ALLOW='<+pipeline.stages.migrate_staging.spec.execution.steps.detect_unsafe_migrations.output.outputVariables.UNSAFE_VERSIONS>'
+                          [ "$ALLOW" = "null" ] && ALLOW=""
+                          echo "→ safe-up allowlist: [${ALLOW}]"
+
+                          echo "→ removing any prior alice-migrate Job"
+                          kubectl -n "$NS" delete job alice-migrate --ignore-not-found --wait=true
+
+                          # Inline Job manifest mirrors the prod Migrate
+                          # stage's shape, scoped to the staging
+                          # namespace. configmap/secret refs use the
+                          # alice-api-env / alice-api-secrets in the
+                          # staging namespace (kustomize generates the
+                          # hashed configmap; the Deployment's envFrom
+                          # name follows the hash but the Job here only
+                          # needs the static `alice-api-env` ConfigMap
+                          # which exists at every reconcile — staging's
+                          # kustomization uses configMapGenerator the
+                          # same way prod's does).
+                          cat <<EOF | kubectl -n "$NS" apply -f -
+                          apiVersion: batch/v1
+                          kind: Job
+                          metadata:
+                            name: alice-migrate
+                            labels:
+                              app.kubernetes.io/name: alice-migrate
+                              app.kubernetes.io/part-of: alice
+                          spec:
+                            backoffLimit: 0
+                            ttlSecondsAfterFinished: 3600
+                            activeDeadlineSeconds: 600
+                            template:
+                              spec:
+                                restartPolicy: Never
+                                serviceAccountName: alice-api
+                                containers:
+                                  - name: migrate
+                                    image: ${IMAGE}
+                                    imagePullPolicy: IfNotPresent
+                                    command: ["./migrate"]
+                                    args: ["safe-up"]
+                                    env:
+                                      - name: ALICE_MIGRATE_SAFE_UP_ALLOW_UNSAFE_VERSIONS
+                                        value: "${ALLOW}"
+                                    envFrom:
+                                      - configMapRef:
+                                          name: alice-api-env
+                                      - secretRef:
+                                          name: alice-api-secrets
+                                    resources:
+                                      requests: { cpu: "250m", memory: "256Mi" }
+                                      limits:   { cpu: "1000m", memory: "512Mi" }
+                          EOF
+
+                          # Poll Job conditions instead of `kubectl wait`
+                          # — same reason as the prod Migrate stage:
+                          # wait subcommand only watches one condition,
+                          # so a Failed Job sits at the deadline before
+                          # exiting. Polling both Complete and Failed
+                          # gives fail-fast + inline logs.
+                          echo "→ waiting for migration to finish (up to 10 min)"
+                          SECONDS=0
+                          while [ $SECONDS -lt 600 ]; do
+                            if kubectl -n "$NS" get job alice-migrate \
+                                -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null \
+                                | grep -q True; then
+                              echo "→ migration complete; printing logs"
+                              kubectl -n "$NS" logs job/alice-migrate --tail=200 || true
+                              exit 0
+                            fi
+                            if kubectl -n "$NS" get job alice-migrate \
+                                -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null \
+                                | grep -q True; then
+                              echo "✗ migration job failed — pod logs:"
+                              kubectl -n "$NS" logs -l job-name=alice-migrate --tail=200 || true
+                              echo "--- job describe ---"
+                              kubectl -n "$NS" describe job alice-migrate | tail -30 || true
+                              exit 1
+                            fi
+                            sleep 5
+                          done
+
+                          echo "✗ migration did not finish within 10 min"
+                          kubectl -n "$NS" describe job alice-migrate | tail -30 || true
+                          kubectl -n "$NS" logs -l job-name=alice-migrate --tail=200 || true
+                          exit 1
+
+    # =====================================================================
+    # Stage 0b — Deploy to staging.
+    #
+    # Runs BEFORE the prod Approval Gate so a bad SHA fails the pipeline
+    # against a real cluster + real ingress + real edge without a human
+    # in the loop. Same alice-api image as prod (pipeline image_tag
+    # variable cascades into the staging service's KustomizePatches
+    # manifest), but a different namespace (alice-staging) and
+    # different ingress host (alice-inhouse-api.machine-pulse.net).
+    #
+    # Pre-requisite: Migrate Staging (above) has advanced the shared DB
+    # to the schema this binary expects. Without that, the pod's /readyz
+    # returns 503 with migrations:out_of_date and Deploy Staging fails
+    # at steady state.
+    #
+    # failureStrategies: MarkAsFailure (not StageRollback) — if staging
+    # is broken, we want the pipeline to halt at approval gate so a
+    # human sees the failure, NOT auto-rollback staging and then sail
+    # through the rest of the pipeline. The next main merge will
+    # redeploy staging cleanly.
+    # =====================================================================
+    - stage:
+        name: Deploy Staging
+        identifier: deploy_staging
+        type: Deployment
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: alice_api_staging
+            serviceInputs:
+              serviceDefinition:
+                type: Kubernetes
+                spec:
+                  artifacts:
+                    primary:
+                      primaryArtifactRef: ecr_alice_api
+                      sources:
+                        - identifier: ecr_alice_api
+                          type: Ecr
+                          spec:
+                            tag: <+pipeline.variables.image_tag>
+          environment:
+            environmentRef: staging
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: staging_eks
+          execution:
+            steps:
+              - step:
+                  name: Rolling Deployment
+                  identifier: rolling_deploy_staging
+                  type: K8sRollingDeploy
+                  timeout: 15m
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: false
+
+    # =====================================================================
+    # Stage 0b — Smoke staging.
+    #
+    # Two-layer check, fail-fast:
+    #
+    #   1. Cluster Smoke — curl /healthz + /readyz on the in-cluster
+    #      Service. Confirms the pod started, HTTP server is listening
+    #      on 8080, and ready probe responds 2xx. Run first because it
+    #      gives the fastest, most actionable signal on a code/config
+    #      regression (no edge, DNS, or CF policy in the picture).
+    #
+    #   2. Edge Smoke — curl /healthz on the public hostname through
+    #      Cloudflare Access using a CF service token (Harness secrets
+    #      alice_staging_cf_client_id / alice_staging_cf_client_secret).
+    #      Confirms the full path: DNS → CF edge → CF Access policy →
+    #      Tunnel → ingress-nginx → cf-jwt-verifier (or legacy EdgeAuth
+    #      depending on the deployed code) → alice-api. A regression on
+    #      ingress annotations, Access policy, or tunnel config fails
+    #      here, NOT after a human approves prod.
+    #
+    # Browser SSO (Okta) is intentionally out of scope here — service
+    # tokens carry their own non_identity policy match; they don't
+    # exercise the Okta side. Manual browser sanity-check remains the
+    # last mile before approval.
+    #
+    # MarkAsFailure on error — same rationale as Deploy Staging.
+    # =====================================================================
+    - stage:
+        name: Smoke Staging
+        identifier: smoke_staging
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Cluster Smoke
+                  identifier: cluster_smoke_staging
+                  type: ShellScript
+                  timeout: 5m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+                          NS=alice-staging
+                          SVC="alice-api.${NS}.svc.cluster.local"
+                          fail=0
+                          for path in /healthz /readyz; do
+                            # In-cluster HTTP. Pod listens on 8080 (see
+                            # infra/deploy/base/alice-api/service.yaml).
+                            # Retry briefly — even after K8sRollingDeploy
+                            # marks the deployment Ready, the Service
+                            # endpoints slice can lag a few seconds.
+                            for attempt in 1 2 3 4 5; do
+                              code=$(curl -s -o /dev/null -w "%{http_code}" \
+                                --connect-timeout 5 --max-time 10 \
+                                "http://${SVC}:8080${path}" || echo 000)
+                              case "$code" in 2*|3*) break ;; esac
+                              sleep 3
+                            done
+                            echo "$code  http://${SVC}:8080${path}"
+                            case "$code" in 2*|3*) ;; *) fail=1 ;; esac
+                          done
+                          exit "$fail"
+
+              - step:
+                  name: Edge Smoke
+                  identifier: edge_smoke_staging
+                  type: ShellScript
+                  timeout: 5m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    environmentVariables:
+                      - name: CF_ACCESS_CLIENT_ID
+                        type: String
+                        value: <+secrets.getValue("alice_staging_cf_client_id")>
+                      - name: CF_ACCESS_CLIENT_SECRET
+                        type: String
+                        value: <+secrets.getValue("alice_staging_cf_client_secret")>
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+                          # Public hostname through CF edge. Pin TLS
+                          # verification (no -k): an expired CF cert
+                          # should fail the smoke. The service token
+                          # headers satisfy the "Allow Service Token
+                          # reusable" policy on the staging Access app
+                          # without involving Okta SSO.
+                          #
+                          # Service token headers are passed to curl via
+                          # a config file on stdin (`-K -`), NOT via -H
+                          # on the argv — that would expose the secret
+                          # in /proc/<pid>/cmdline (world-readable on
+                          # Linux) for the lifetime of the curl process.
+                          # With -K -, the headers live only in curl's
+                          # heap-allocated config parse.
+                          API="https://alice-inhouse-api.machine-pulse.net"
+                          fail=0
+                          for path in /healthz /readyz; do
+                            URL="${API}${path}"
+                            # Brief retry — CF cache + tunnel propagation
+                            # can lag the in-cluster rollout by a few seconds.
+                            for attempt in 1 2 3 4 5; do
+                              code=$(curl -s -o /tmp/edge-body.txt -w "%{http_code}" \
+                                --connect-timeout 10 --max-time 30 \
+                                -K - "${URL}" <<EOF || echo 000
+                          header = "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}"
+                          header = "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}"
+                          EOF
+                          )
+                              case "$code" in 2*) break ;; esac
+                              sleep 3
+                            done
+                            echo "$code  ${URL}"
+                            # Non-2xx is a failure: a 302 here means CF
+                            # bounced us to the Okta login (token not
+                            # accepted), which is exactly the regression
+                            # we want this step to catch.
+                            case "$code" in
+                              2*) ;;
+                              *)
+                                echo "  body: $(head -c 200 /tmp/edge-body.txt 2>/dev/null)"
+                                fail=1
+                                ;;
+                            esac
+                          done
+                          rm -f /tmp/edge-body.txt
+                          exit "$fail"
+
+    # =====================================================================
+    # Stage 1 — Approval Gate.
+    # Three steps:
+    #   1. Abort Prior Pending Approvals — kills any earlier execution of
+    #      THIS pipeline that is still parked in ApprovalWaiting, so a new
+    #      push supersedes the stale one instead of stacking up.
+    #   2. Generate Change Summary — resolves the last successfully deployed
+    #      SHA from a k8s Deployment annotation on alice-api,
+    #      calls the GitHub /compare API for commits between baseline and
+    #      the new image_tag, and asks an LLM to summarize them for the
+    #      reviewer. Falls back to raw commit list if the LLM is unavailable.
+    #   3. Approve Production Deploy — the actual HarnessApproval gate.
+    #      Displays the summary + compare link to the reviewer.
+    #
+    # The summary is intentionally generated INSIDE the approval stage (not
+    # before it) so the LLM run cost is paid only for pipelines that are
+    # actually about to wait on a human. If the approval is rejected the
+    # rest of the pipeline never runs.
+    # =====================================================================
+    - stage:
+        name: Approval Gate
+        identifier: approval_gate
+        type: Approval
+        spec:
+          execution:
+            steps:
+              # Abort any prior ApprovalWaiting run of this same pipeline so
+              # the new run supersedes it. List/abort errors are tolerated
+              # (MarkAsSuccess) so a token expiry or race doesn't block the
+              # new deploy.
+              - step:
+                  name: Abort Prior Pending Approvals
+                  identifier: abort_prior_pending
+                  type: ShellScript
+                  timeout: 2m
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: MarkAsSuccess
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -uo pipefail
+
+                          HARNESS_API_KEY='<+secrets.getValue("harness_sa_api_key")>'
+                          ACCOUNT_ID="<+account.identifier>"
+                          ORG_ID="default"
+                          PROJECT_ID="Alice"
+                          PIPELINE_ID="alice_prod_deploy"
+                          SELF_PLAN_ID="<+pipeline.executionId>"
+                          API_BASE="https://machinepulse.harness.io"
+
+                          # jq bootstrap — delegate image lacks jq; arch-aware download
+                          # because Alice's prod nodes are Graviton (arm64) — the amd64
+                          # binary from karpo's template silently fails with "cannot execute".
+                          case "$(uname -m)" in
+                            aarch64|arm64)
+                              JQ_BIN=jq-linux-arm64
+                              JQ_SHA=4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5
+                              ;;
+                            *)
+                              JQ_BIN=jq-linux-amd64
+                              JQ_SHA=5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5
+                              ;;
+                          esac
+                          if ! command -v jq >/dev/null 2>&1; then
+                            if [ ! -x /tmp/jq ] || \
+                               ! echo "$JQ_SHA  /tmp/jq" | sha256sum -c - >/dev/null 2>&1; then
+                              curl -sfL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/$JQ_BIN" -o /tmp/jq && \
+                                echo "$JQ_SHA  /tmp/jq" | sha256sum -c - && \
+                                chmod +x /tmp/jq
+                            fi
+                            export PATH="/tmp:$PATH"
+                          fi
+                          if ! command -v jq >/dev/null 2>&1; then
+                            echo "WARN: jq unavailable — skipping abort, allowing new run"
+                            exit 0
+                          fi
+
+                          LIST_URL="${API_BASE}/pipeline/api/pipelines/execution/summary?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&pipelineIdentifier=${PIPELINE_ID}&size=50&page=0"
+                          BODY='{"filterType":"PipelineExecution","status":["ApprovalWaiting"]}'
+
+                          if ! RESP=$(curl -sf -X POST "$LIST_URL" \
+                              -H "x-api-key: $HARNESS_API_KEY" \
+                              -H "content-type: application/json" \
+                              -d "$BODY"); then
+                            echo "WARN: list API failed — skipping abort, allowing new run"
+                            exit 0
+                          fi
+
+                          # Filter out self (defensive — new run is Running, not ApprovalWaiting)
+                          # and AbortAll the rest.
+                          PLAN_IDS=$(echo "$RESP" | jq -r --arg self "$SELF_PLAN_ID" \
+                            '.data.content[]? | select(.planExecutionId != $self) | .planExecutionId')
+
+                          if [ -z "$PLAN_IDS" ]; then
+                            echo "No prior pending-approval executions for $PIPELINE_ID"
+                            exit 0
+                          fi
+
+                          for ID in $PLAN_IDS; do
+                            ABORT_URL="${API_BASE}/pipeline/api/pipeline/execute/interrupt/${ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&interruptType=AbortAll"
+                            HTTP=$(curl -s -o /tmp/abort-$ID.json -w '%{http_code}' -X PUT "$ABORT_URL" \
+                              -H "x-api-key: $HARNESS_API_KEY")
+                            if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+                              echo "aborted prior execution $ID"
+                            else
+                              echo "WARN: abort $ID returned HTTP $HTTP — $(cat /tmp/abort-$ID.json)"
+                            fi
+                            rm -f /tmp/abort-$ID.json
+                          done
+
+              # Resolves LAST_PROD_SHA via the Deployment annotation written by
+              # the Release stage's Record Prod Image Tag step at the end of
+              # the previous successful run. Falls back to the live image tag
+              # if the annotation is missing or not a hex SHA. Outputs
+              # CHANGE_SUMMARY (LLM-formatted), RAW_COMMITS (ground truth),
+              # and LAST_PROD_SHA for downstream steps.
+              - step:
+                  name: Generate Change Summary
+                  identifier: generate_summary
+                  type: ShellScript
+                  timeout: 5m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -o pipefail
+
+                          OPENROUTER_KEY='<+secrets.getValue("openrouter_api_key")>'
+                          CURRENT_SHA="<+pipeline.variables.image_tag>"
+                          ORG="machinepulse-ai"
+                          REPO="alice-beta"
+                          SERVICE="alice-api"
+                          LLM_MODEL="anthropic/claude-haiku-4-5"
+                          ANNOTATION_KEY="alice.machine-pulse.net/last-prod-sha"
+                          PRIVATE_KEY_VAL='<+secrets.getValue("account.mp_harness_private_key")>'
+
+                          # jq bootstrap (delegate image lacks jq). Same -x + sha256 verify gate
+                          # as the abort-prior steps — a partial /tmp/jq left by an earlier step
+                          # (file present but not yet chmod +x, or different version cached) would
+                          # otherwise pass a bare -f check and silently fall through to JQ=cat,
+                          # which surfaces as a misleading BASELINE_ERROR rather than a download
+                          # failure log. Arch-aware: Alice nodes are Graviton arm64.
+                          case "$(uname -m)" in
+                            aarch64|arm64)
+                              JQ_BIN=jq-linux-arm64
+                              JQ_SHA=4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5
+                              ;;
+                            *)
+                              JQ_BIN=jq-linux-amd64
+                              JQ_SHA=5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5
+                              ;;
+                          esac
+                          if [ ! -x /tmp/jq ] || \
+                             ! echo "$JQ_SHA  /tmp/jq" | sha256sum -c - >/dev/null 2>&1; then
+                            curl -sfL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/$JQ_BIN" -o /tmp/jq && \
+                              echo "$JQ_SHA  /tmp/jq" | sha256sum -c - && \
+                              chmod +x /tmp/jq
+                          fi
+                          JQ=/tmp/jq
+                          if [ ! -x "$JQ" ]; then
+                            echo "WARN: jq download failed, using raw output"
+                            JQ="cat"
+                          fi
+
+                          # Generate GitHub App installation token via JWT — no git clone
+                          # needed, API-only access. PEM private key is account-scoped in
+                          # Harness as a SecretFile; <+secrets.getValue()> on the delegate
+                          # returns its contents inline, written here via printf.
+                          GITHUB_PAT=""
+                          if [ "$JQ" != "cat" ]; then
+                            APP_ID="3125495"
+                            INSTALL_ID="117359680"
+                            PEM_FILE=$(mktemp /tmp/gh-app-key-XXXXXXXX.pem)
+                            trap "rm -f $PEM_FILE" EXIT
+                            printf '%b' "$PRIVATE_KEY_VAL" > "$PEM_FILE"
+                            chmod 600 "$PEM_FILE"
+                            if ! head -1 "$PEM_FILE" | grep -q "BEGIN"; then
+                              echo "WARN: PEM file invalid, change summary will be limited"
+                            else
+                              NOW_JWT=$(date +%s)
+                              IAT=$((NOW_JWT - 60))
+                              EXP=$((NOW_JWT + 600))
+                              HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+                              PAYLOAD=$(printf '{"iss":"%s","iat":%d,"exp":%d}' "$APP_ID" "$IAT" "$EXP" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+                              SIGN_INPUT="$HEADER.$PAYLOAD"
+                              SIGNATURE=$(printf '%s' "$SIGN_INPUT" | openssl dgst -sha256 -sign "$PEM_FILE" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+                              JWT="$SIGN_INPUT.$SIGNATURE"
+                              GITHUB_PAT=$(curl -sf -X POST \
+                                -H "Authorization: Bearer $JWT" \
+                                -H "Accept: application/vnd.github+json" \
+                                "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" \
+                                | $JQ -r '.token')
+                            fi
+                          fi
+                          if [ -z "$GITHUB_PAT" ] || [ "$GITHUB_PAT" = "null" ]; then
+                            echo "WARN: Failed to generate GitHub App token, change summary will be limited"
+                            GITHUB_PAT=""
+                          fi
+
+                          # Resolve last prod SHA. Priority:
+                          #   1. Deployment annotation (authoritative, written by Release stage)
+                          #   2. Live deployment image tag (fallback — valid once at least one
+                          #      deploy has replaced the kustomize default placeholder)
+                          # Both values must be a 40-char hex SHA; anything else stays empty
+                          # and surfaces a BASELINE_ERROR in the approval message rather than
+                          # fabricating a misleading "recent commits" list.
+                          echo "=== Resolving last prod SHA ==="
+                          LAST_PROD_SHA=""
+                          # jsonpath needs dots inside the annotation key escaped; slashes are
+                          # passed through as-is. Karpo's version had a literal "karpo\.ai/..."
+                          # because it was a single hard-coded key; we templatize the key so
+                          # sed-escape only the dots.
+                          # Alice's GHA (deploy-images.yml) uses `git rev-parse --short=12`,
+                          # so image_tag is a 12-char short SHA — not the 40-char form Karpo
+                          # uses. Accept 7-40 hex chars; GitHub /compare resolves short SHAs
+                          # transparently, and 7 is git's minimum-abbrev guarantee.
+                          ESCAPED_KEY=$(printf '%s' "$ANNOTATION_KEY" | sed 's|\.|\\.|g')
+                          ANNOT_SHA=$(kubectl get deployment "$SERVICE" -n alice \
+                            -o jsonpath="{.metadata.annotations.${ESCAPED_KEY}}" 2>/dev/null || echo "")
+                          if printf '%s' "$ANNOT_SHA" | grep -qE '^[0-9a-f]{7,40}$'; then
+                            LAST_PROD_SHA="$ANNOT_SHA"
+                            echo "Last prod SHA (from Deployment annotation $ANNOTATION_KEY): $LAST_PROD_SHA"
+                          else
+                            [ -n "$ANNOT_SHA" ] && echo "Annotation value '$ANNOT_SHA' is not a hex SHA; falling back to image tag" \
+                                              || echo "Annotation $ANNOTATION_KEY unset; falling back to image tag"
+                            PROD_IMAGE=$(kubectl get deployment "$SERVICE" -n alice \
+                              -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+                            if [ -n "$PROD_IMAGE" ]; then
+                              TAG="${PROD_IMAGE##*:}"
+                              echo "Current prod image: $PROD_IMAGE"
+                              if printf '%s' "$TAG" | grep -qE '^[0-9a-f]{7,40}$'; then
+                                LAST_PROD_SHA="$TAG"
+                                echo "Last prod SHA (from image tag): $LAST_PROD_SHA"
+                              else
+                                echo "Image tag '$TAG' is not a hex SHA; treating as no baseline"
+                              fi
+                            else
+                              echo "No prod deployment found"
+                            fi
+                          fi
+                          [ -z "$LAST_PROD_SHA" ] && echo "No baseline — approval message will surface an error"
+
+                          echo "=== Generating Change Summary ==="
+
+                          # Collect commits between LAST_PROD_SHA and CURRENT_SHA via GitHub /compare.
+                          # We deliberately do NOT fall back to "recent N commits" when LAST_PROD_SHA
+                          # is empty — that gives a misleading approval message that looks
+                          # comprehensive but isn't bounded by any prod baseline. Instead we
+                          # surface the error and let the approver decide.
+                          ALL_COMMITS=""
+                          BASELINE_ERROR=""
+                          if [ -n "$LAST_PROD_SHA" ]; then
+                            CMP=$(curl -sf -H "Authorization: token $GITHUB_PAT" \
+                              "https://api.github.com/repos/$ORG/$REPO/compare/${LAST_PROD_SHA}...${CURRENT_SHA}" 2>/dev/null || echo "")
+                            if [ -n "$CMP" ] && [ "$JQ" != "cat" ]; then
+                              COMMITS=$($JQ -r '.commits[]? | "- " + (.commit.message | split("\n")[0])' <<< "$CMP" 2>/dev/null || echo "")
+                            fi
+                            [ -n "${COMMITS:-}" ] && ALL_COMMITS="## $REPO"$'\n'"$COMMITS"$'\n'
+                            if [ -z "$ALL_COMMITS" ]; then
+                              BASELINE_ERROR="**ERROR**: GitHub /compare returned no commits for \`$LAST_PROD_SHA...$CURRENT_SHA\`. Possible causes: baseline SHA not in repo, SHAs identical, or GitHub API auth failed."
+                            fi
+                          else
+                            BASELINE_ERROR="**ERROR**: Could not determine the last prod SHA. Annotation \`$ANNOTATION_KEY\` on deployment/$SERVICE in namespace alice is unset (or not a hex SHA), and the deployment's image tag is not a hex SHA. Bootstrap via \`kubectl -n alice annotate deployment $SERVICE $ANNOTATION_KEY=<SHA> --overwrite\` then re-trigger. Approving now will deploy without a verified change list."
+                          fi
+
+                          # Call OpenRouter for LLM summary; fall back to raw commit titles.
+                          SUMMARY=""
+                          if [ -n "$ALL_COMMITS" ] && [ -n "$OPENROUTER_KEY" ] && [ "$JQ" != "cat" ]; then
+                            echo "Calling LLM (model=$LLM_MODEL)..."
+                            SYSTEM_PROMPT="You are a deployment change summarizer. Given git commit logs from the alice-beta repo, create a concise summary for the production deployment reviewer.\n\nFormat:\n## Risk: [low/medium/high]\n## Key Changes (2-3 sentences)\n## Details\n- [type]: description\n## Attention (if any)\n\nRules: group by feat/fix/refactor/config. Flag security/auth/schema changes. Under 400 words."
+
+                            REQUEST=$($JQ -n \
+                              --arg model "$LLM_MODEL" \
+                              --arg system "$SYSTEM_PROMPT" \
+                              --arg user "$ALL_COMMITS" \
+                              '{model: $model, messages: [{role: "system", content: $system}, {role: "user", content: $user}], temperature: 0.3, max_tokens: 800}')
+
+                            LLM_RESP=$(curl -s "https://openrouter.ai/api/v1/chat/completions" \
+                              -H "Content-Type: application/json" \
+                              -H "Authorization: Bearer $OPENROUTER_KEY" \
+                              -d "$REQUEST" 2>/dev/null || echo "")
+
+                            if [ -n "$LLM_RESP" ]; then
+                              SUMMARY=$($JQ -r '.choices[0].message.content // ""' <<< "$LLM_RESP" 2>/dev/null || echo "")
+                            fi
+                            [ -n "$SUMMARY" ] && echo "LLM summary generated (${#SUMMARY} chars)" || echo "WARN: LLM call failed, using raw commits"
+                          else
+                            echo "WARN: skipping LLM (commits empty: $([ -z "$ALL_COMMITS" ] && echo yes || echo no), key empty: $([ -z "$OPENROUTER_KEY" ] && echo yes || echo no), jq=$JQ)"
+                          fi
+
+                          # Sanitize (prevent Harness expression parsing of any "<+" literal) and export.
+                          if [ -n "$SUMMARY" ]; then
+                            CHANGE_SUMMARY=$(echo "$SUMMARY" | sed 's/<+/< +/g')
+                          elif [ -n "$ALL_COMMITS" ]; then
+                            CHANGE_SUMMARY=$(echo "$ALL_COMMITS" | sed 's/<+/< +/g')
+                          elif [ -n "$BASELINE_ERROR" ]; then
+                            CHANGE_SUMMARY="$BASELINE_ERROR"
+                          else
+                            CHANGE_SUMMARY="**ERROR**: No commits and no diagnosable baseline error — likely a bug in generate_summary itself. Check step log."
+                          fi
+                          if [ -n "$ALL_COMMITS" ]; then
+                            RAW_COMMITS=$(echo "$ALL_COMMITS" | sed 's/<+/< +/g')
+                          else
+                            RAW_COMMITS=""
+                          fi
+                          export CHANGE_SUMMARY RAW_COMMITS LAST_PROD_SHA
+                          echo "=== Change Summary ==="
+                          echo "$CHANGE_SUMMARY"
+                    outputVariables:
+                      - name: CHANGE_SUMMARY
+                        type: String
+                        value: CHANGE_SUMMARY
+                      - name: RAW_COMMITS
+                        type: String
+                        value: RAW_COMMITS
+                      - name: LAST_PROD_SHA
+                        type: String
+                        value: LAST_PROD_SHA
+
+              # Human approval gate. 72h matches Karpo — gives weekend-pushed
+              # deploys until Monday morning to be reviewed before the
+                  # execution auto-expires.
+              - step:
+                  name: Approve Production Deploy
+                  identifier: approve_prod
+                  type: HarnessApproval
+                  timeout: 72h
+                  spec:
+                    approvalMessage: |
+                      **Service:** alice-api + staged Vercel Production frontend
+                      **Compare:** https://github.com/machinepulse-ai/alice-beta/compare/<+pipeline.stages.approval_gate.spec.execution.steps.generate_summary.output.outputVariables.LAST_PROD_SHA>...<+pipeline.variables.image_tag>
+
+                      ### Commits since last prod deploy
+                      <+pipeline.stages.approval_gate.spec.execution.steps.generate_summary.output.outputVariables.RAW_COMMITS>
+
+                      ---
+
+                      <+pipeline.stages.approval_gate.spec.execution.steps.generate_summary.output.outputVariables.CHANGE_SUMMARY>
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                      userGroups:
+                        - _project_all_users
+                        - account._account_all_users
+                    isAutoRejectEnabled: false
+
+    # =====================================================================
+    # Stage 2 — DB migrations. Custom stage runs `kubectl apply` against
+    # the alice-migrate Job (after deleting any stale instance), waits
+    # for completion, fails the pipeline on a non-success Job status.
+    # The whole rest of the pipeline is gated on this finishing.
+    #
+    # First step (Abort Prior Running) kills any earlier execution of THIS
+    # pipeline that has already been approved and is mid-deploy. We only
+    # do this once the new run has cleared Approval Gate — earlier abort
+    # would risk killing a deploy that was about to finish cleanly. Once
+    # the human says "yes, deploy this newer SHA", the older in-flight one
+    # is no longer wanted.
+    # =====================================================================
+    - stage:
+        name: Migrate
+        identifier: migrate
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Abort Prior Running
+                  identifier: abort_prior_running
+                  type: ShellScript
+                  timeout: 2m
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: MarkAsSuccess
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -uo pipefail
+
+                          HARNESS_API_KEY='<+secrets.getValue("harness_sa_api_key")>'
+                          ACCOUNT_ID="<+account.identifier>"
+                          ORG_ID="default"
+                          PROJECT_ID="Alice"
+                          PIPELINE_ID="alice_prod_deploy"
+                          SELF_PLAN_ID="<+pipeline.executionId>"
+                          API_BASE="https://machinepulse.harness.io"
+
+                          # jq bootstrap — arch-aware (Alice runs Graviton arm64; see
+                          # abort_prior_pending step for full rationale).
+                          case "$(uname -m)" in
+                            aarch64|arm64)
+                              JQ_BIN=jq-linux-arm64
+                              JQ_SHA=4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5
+                              ;;
+                            *)
+                              JQ_BIN=jq-linux-amd64
+                              JQ_SHA=5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5
+                              ;;
+                          esac
+                          if ! command -v jq >/dev/null 2>&1; then
+                            if [ ! -x /tmp/jq ] || \
+                               ! echo "$JQ_SHA  /tmp/jq" | sha256sum -c - >/dev/null 2>&1; then
+                              curl -sfL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/$JQ_BIN" -o /tmp/jq && \
+                                echo "$JQ_SHA  /tmp/jq" | sha256sum -c - && \
+                                chmod +x /tmp/jq
+                            fi
+                            export PATH="/tmp:$PATH"
+                          fi
+                          if ! command -v jq >/dev/null 2>&1; then
+                            echo "WARN: jq unavailable — skipping abort, allowing new run"
+                            exit 0
+                          fi
+
+                          # Filter status=Running this time (vs ApprovalWaiting in Stage 1).
+                          LIST_URL="${API_BASE}/pipeline/api/pipelines/execution/summary?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&pipelineIdentifier=${PIPELINE_ID}&size=50&page=0"
+                          BODY='{"filterType":"PipelineExecution","status":["Running"]}'
+
+                          if ! RESP=$(curl -sf -X POST "$LIST_URL" \
+                              -H "x-api-key: $HARNESS_API_KEY" \
+                              -H "content-type: application/json" \
+                              -d "$BODY"); then
+                            echo "WARN: list API failed — skipping abort, allowing new run"
+                            exit 0
+                          fi
+
+                          # Exclude self (we are also Running right now).
+                          PLAN_IDS=$(echo "$RESP" | jq -r --arg self "$SELF_PLAN_ID" \
+                            '.data.content[]? | select(.planExecutionId != $self) | .planExecutionId')
+
+                          if [ -z "$PLAN_IDS" ]; then
+                            echo "No prior running executions for $PIPELINE_ID"
+                            exit 0
+                          fi
+
+                          for ID in $PLAN_IDS; do
+                            ABORT_URL="${API_BASE}/pipeline/api/pipeline/execute/interrupt/${ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&interruptType=AbortAll"
+                            HTTP=$(curl -s -o /tmp/abort-$ID.json -w '%{http_code}' -X PUT "$ABORT_URL" \
+                              -H "x-api-key: $HARNESS_API_KEY")
+                            if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+                              echo "aborted prior running execution $ID"
+                            else
+                              echo "WARN: abort $ID returned HTTP $HTTP — $(cat /tmp/abort-$ID.json)"
+                            fi
+                            rm -f /tmp/abort-$ID.json
+                          done
+
+              - step:
+                  name: Run Migrations
+                  identifier: run_migrations
+                  type: ShellScript
+                  timeout: 15m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          NS=alice
+                          IMAGE_TAG='<+pipeline.variables.image_tag>'
+                          IMAGE="651527661132.dkr.ecr.ap-southeast-1.amazonaws.com/alice-api:${IMAGE_TAG}"
+
+                          echo "→ removing any prior alice-migrate Job"
+                          kubectl -n "$NS" delete job alice-migrate --ignore-not-found --wait=true
+
+                          echo "→ submitting fresh alice-migrate Job (image $IMAGE)"
+                          # Inline manifest mirrors infra/deploy/base/alice-migrate-job/job.yaml
+                          # but with the resolved image — easier than rendering kustomize
+                          # client-side here, and the Job is short-lived enough that
+                          # configmap drift between this and the Deployment env is fine.
+                          cat <<EOF | kubectl -n "$NS" apply -f -
+                          apiVersion: batch/v1
+                          kind: Job
+                          metadata:
+                            name: alice-migrate
+                            labels:
+                              app.kubernetes.io/name: alice-migrate
+                              app.kubernetes.io/part-of: alice
+                          spec:
+                            backoffLimit: 0
+                            ttlSecondsAfterFinished: 3600
+                            activeDeadlineSeconds: 600
+                            template:
+                              spec:
+                                restartPolicy: Never
+                                serviceAccountName: alice-api
+                                containers:
+                                  - name: migrate
+                                    image: ${IMAGE}
+                                    imagePullPolicy: IfNotPresent
+                                    command: ["./migrate"]
+                                    args: ["up"]
+                                    envFrom:
+                                      - configMapRef:
+                                          name: alice-api-env
+                                      - secretRef:
+                                          name: alice-api-secrets
+                                    resources:
+                                      requests: { cpu: "250m", memory: "256Mi" }
+                                      limits:   { cpu: "1000m", memory: "512Mi" }
+                          EOF
+
+                          # Poll Job conditions instead of `kubectl wait --for=condition=complete`.
+                          # The wait subcommand only watches one condition at a time, so a Job
+                          # that flips to Failed silently sits at the deadline before kubectl
+                          # exits — a pod that crashes in seconds still burns the full 10m.
+                          # Polling both Complete and Failed lets the step fail fast and dump
+                          # logs inline so the cause is visible without a separate kubectl run.
+                          echo "→ waiting for migration to finish (up to 10 min)"
+                          SECONDS=0
+                          while [ $SECONDS -lt 600 ]; do
+                            if kubectl -n "$NS" get job alice-migrate \
+                                -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null \
+                                | grep -q True; then
+                              echo "→ migration complete; printing logs"
+                              kubectl -n "$NS" logs job/alice-migrate --tail=200 || true
+                              exit 0
+                            fi
+                            if kubectl -n "$NS" get job alice-migrate \
+                                -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null \
+                                | grep -q True; then
+                              echo "✗ migration job failed — pod logs:"
+                              kubectl -n "$NS" logs -l job-name=alice-migrate --tail=200 || true
+                              echo "--- job describe ---"
+                              kubectl -n "$NS" describe job alice-migrate | tail -30 || true
+                              exit 1
+                            fi
+                            sleep 5
+                          done
+
+                          echo "✗ migration did not finish within 10 min"
+                          kubectl -n "$NS" describe job alice-migrate | tail -30 || true
+                          kubectl -n "$NS" logs -l job-name=alice-migrate --tail=200 || true
+                          exit 1
+
+    # =====================================================================
+    # Stage 3 — Deploy alice-api (K8s rolling deploy via Kustomize service).
+    # Same image_tag flows into the artifact source; the K8sRollingDeploy
+    # step waits for `kubectl rollout status` so the stage succeeds only
+    # after every replica is ready (which means /readyz is green).
+    # =====================================================================
+    - stage:
+        name: Deploy alice-api
+        identifier: deploy_alice_api
+        type: Deployment
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: alice_api
+            serviceInputs:
+              serviceDefinition:
+                type: Kubernetes
+                spec:
+                  artifacts:
+                    primary:
+                      primaryArtifactRef: ecr_alice_api
+                      sources:
+                        - identifier: ecr_alice_api
+                          type: Ecr
+                          spec:
+                            tag: <+pipeline.variables.image_tag>
+          environment:
+            environmentRef: prod
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: prod_eks
+          execution:
+            steps:
+              - step:
+                  name: Rolling Deployment
+                  identifier: rolling_deploy
+                  type: K8sRollingDeploy
+                  timeout: 15m
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: false
+            rollbackSteps:
+              - step:
+                  name: Rolling Rollback
+                  identifier: rolling_rollback
+                  type: K8sRollingRollback
+                  timeout: 10m
+                  spec: {}
+
+    # =====================================================================
+    # Stage 4 — Promote Vercel. The prod frontend is built by Vercel
+    # on every main merge, but Vercel's Production Branch auto-assign
+    # must be disabled so the deployment stays STAGED until this step.
+    # This keeps the public web release behind the same approval gate as
+    # the EKS backend rollout, without rebuilding the frontend inside
+    # Harness.
+    # =====================================================================
+    - stage:
+        name: Promote Vercel
+        identifier: promote_vercel
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Promote Staged Production
+                  identifier: promote_staged_production
+                  type: ShellScript
+                  timeout: 25m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          VERCEL_TOKEN='<+secrets.getValue("vercel_promote_token")>'
+                          API_BASE="https://api.vercel.com"
+                          PROJECT_REF="prj_rKWJX61CVCnZUNn31gHfGBQf0DXh"
+                          TEAM_ID="team_0CKdOrgH1aBJQwTpVWxZyvbv"
+                          TIMEOUT_SECONDS=1200
+                          IMAGE_TAG='<+pipeline.variables.image_tag>'
+                          COMMIT_SHA='<+pipeline.variables.commit_sha>'
+                          if [ -z "$COMMIT_SHA" ]; then
+                            COMMIT_SHA="$IMAGE_TAG"
+                          fi
+
+                          if [ -z "$VERCEL_TOKEN" ]; then
+                            echo "✗ Vercel token secret vercel_promote_token is empty"
+                            exit 1
+                          fi
+                          if ! printf '%s' "$COMMIT_SHA" | grep -qE '^[0-9a-f]{7,40}$'; then
+                            echo "✗ commit_sha '$COMMIT_SHA' is not a Git SHA"
+                            exit 1
+                          fi
+
+                          # jq bootstrap — same pinned binary as the other
+                          # pipeline API steps; delegate image does not
+                          # guarantee jq is installed.
+                          case "$(uname -m)" in
+                            aarch64|arm64)
+                              JQ_BIN=jq-linux-arm64
+                              JQ_SHA=4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5
+                              ;;
+                            *)
+                              JQ_BIN=jq-linux-amd64
+                              JQ_SHA=5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5
+                              ;;
+                          esac
+                          if [ ! -x /tmp/jq ] || \
+                             ! echo "$JQ_SHA  /tmp/jq" | sha256sum -c - >/dev/null 2>&1; then
+                            curl -sfL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/$JQ_BIN" -o /tmp/jq && \
+                              echo "$JQ_SHA  /tmp/jq" | sha256sum -c - && \
+                              chmod +x /tmp/jq
+                          fi
+                          JQ=/tmp/jq
+                          if [ ! -x "$JQ" ]; then
+                            echo "✗ jq unavailable; cannot safely parse Vercel deployment list"
+                            exit 1
+                          fi
+
+                          AUTH_CONFIG=$(mktemp /tmp/vercel-auth-XXXXXXXX)
+                          trap 'rm -f "$AUTH_CONFIG" /tmp/vercel-deployments.json /tmp/vercel-deployment.json /tmp/vercel-promote.json' EXIT
+                          chmod 600 "$AUTH_CONFIG"
+                          # Keep the bearer token out of curl argv.
+                          printf 'header = "Authorization: Bearer %s"\n' "$VERCEL_TOKEN" > "$AUTH_CONFIG"
+
+                          echo "→ waiting for staged Vercel Production deployment for $COMMIT_SHA (project=$PROJECT_REF)"
+                          DEADLINE=$((SECONDS + TIMEOUT_SECONDS))
+                          DEPLOYMENT_ROW=""
+                          while [ $SECONDS -lt $DEADLINE ]; do
+                            curl -sfG -K "$AUTH_CONFIG" "$API_BASE/v6/deployments" \
+                              --data-urlencode "teamId=$TEAM_ID" \
+                              --data-urlencode "projectId=$PROJECT_REF" \
+                              --data-urlencode "target=production" \
+                              --data-urlencode "state=READY" \
+                              --data-urlencode "limit=20" \
+                              -o /tmp/vercel-deployments.json
+
+                            DEPLOYMENT_ROW=$($JQ -r --arg sha "$COMMIT_SHA" --arg image "$IMAGE_TAG" '
+                              .deployments[]?
+                              | (.meta.githubCommitSha // .gitSource.sha // "") as $git_sha
+                              | select($git_sha != "")
+                              | select(
+                                  $git_sha == $sha or
+                                  $git_sha == $image or
+                                  ($image != "" and ($git_sha | startswith($image))) or
+                                  ($sha != "" and ($sha | startswith($git_sha)))
+                                )
+                              | select((.readyState // "") == "READY")
+                              | select((.readySubstate // "") == "STAGED")
+                              | [.uid, .url, $git_sha, (.readySubstate // ""), ((.createdAt // 0) | tostring)]
+                              | @tsv
+                            ' /tmp/vercel-deployments.json | head -n1)
+
+                            if [ -n "$DEPLOYMENT_ROW" ]; then
+                              break
+                            fi
+
+                            # Idempotency on pipeline retry: if a matching
+                            # deployment for this SHA is already PROMOTED
+                            # (e.g. promote succeeded on a prior run, smoke
+                            # then failed transiently and the pipeline is
+                            # being re-run), accept the existing promotion
+                            # and exit 0 — there is nothing to do, the
+                            # frontend is already on this commit.
+                            PROMOTED_ROW=$($JQ -r --arg sha "$COMMIT_SHA" --arg image "$IMAGE_TAG" '
+                              .deployments[]?
+                              | (.meta.githubCommitSha // .gitSource.sha // "") as $git_sha
+                              | select($git_sha != "")
+                              | select(
+                                  $git_sha == $sha or
+                                  $git_sha == $image or
+                                  ($image != "" and ($git_sha | startswith($image))) or
+                                  ($sha != "" and ($sha | startswith($git_sha)))
+                                )
+                              | select((.readyState // "") == "READY")
+                              | select((.readySubstate // "") == "PROMOTED")
+                              | [.uid, .url, $git_sha]
+                              | @tsv
+                            ' /tmp/vercel-deployments.json | head -n1)
+                            if [ -n "$PROMOTED_ROW" ]; then
+                              echo "✓ matching deployment for $COMMIT_SHA is already PROMOTED — nothing to do (pipeline retry case):"
+                              echo "$PROMOTED_ROW"
+                              exit 0
+                            fi
+
+                            # Anything else READY-but-not-STAGED for this
+                            # SHA points at auto-assign being re-enabled
+                            # (a fresh main build went live without going
+                            # through this gate). Fail loudly so the
+                            # operator fixes the project setting before
+                            # relying on the gate.
+                            NON_STAGED_ROW=$($JQ -r --arg sha "$COMMIT_SHA" --arg image "$IMAGE_TAG" '
+                              .deployments[]?
+                              | (.meta.githubCommitSha // .gitSource.sha // "") as $git_sha
+                              | select($git_sha != "")
+                              | select(
+                                  $git_sha == $sha or
+                                  $git_sha == $image or
+                                  ($image != "" and ($git_sha | startswith($image))) or
+                                  ($sha != "" and ($sha | startswith($git_sha)))
+                                )
+                              | select((.readyState // "") == "READY")
+                              | select((.readySubstate // "") != "STAGED")
+                              | select((.readySubstate // "") != "PROMOTED")
+                              | [.uid, .url, $git_sha, (.readySubstate // "<none>")]
+                              | @tsv
+                            ' /tmp/vercel-deployments.json | head -n1)
+                            if [ -n "$NON_STAGED_ROW" ]; then
+                              echo "✗ Matching Vercel deployment is READY but neither STAGED nor PROMOTED:"
+                              echo "$NON_STAGED_ROW"
+                              echo "This usually means Vercel Production Branch auto-assign is still enabled. Disable it before relying on the Harness gate."
+                              exit 1
+                            fi
+
+                            echo "  no staged deployment yet; retrying in 15s"
+                            sleep 15
+                          done
+
+                          if [ -z "$DEPLOYMENT_ROW" ]; then
+                            echo "✗ timed out waiting for staged Vercel Production deployment for $COMMIT_SHA"
+                            echo "Recent READY production deployments:"
+                            $JQ -r '
+                              .deployments[:10][]?
+                              | "- uid=\(.uid) url=\(.url) sha=\(.meta.githubCommitSha // .gitSource.sha // "<none>") ready=\(.readyState // "<none>") substate=\(.readySubstate // "<none>")"
+                            ' /tmp/vercel-deployments.json || true
+                            exit 1
+                          fi
+
+                          IFS=$'\t' read -r DEPLOYMENT_ID DEPLOYMENT_URL DEPLOYMENT_SHA DEPLOYMENT_SUBSTATE DEPLOYMENT_CREATED_AT <<< "$DEPLOYMENT_ROW"
+                          echo "→ promoting Vercel deployment $DEPLOYMENT_ID ($DEPLOYMENT_URL, sha=$DEPLOYMENT_SHA, substate=$DEPLOYMENT_SUBSTATE)"
+
+                          HTTP_CODE=$(curl -s -o /tmp/vercel-promote.json -w '%{http_code}' \
+                            -X POST \
+                            -K "$AUTH_CONFIG" \
+                            "$API_BASE/v10/projects/$PROJECT_REF/promote/$DEPLOYMENT_ID?teamId=$TEAM_ID")
+
+                          case "$HTTP_CODE" in
+                            200|201|202|204)
+                              echo "→ promote accepted (HTTP $HTTP_CODE)"
+                              ;;
+                            *)
+                              echo "✗ Vercel promote returned HTTP $HTTP_CODE"
+                              cat /tmp/vercel-promote.json || true
+                              exit 1
+                              ;;
+                          esac
+
+                          # Promotion is normally near-instantaneous (the
+                          # promote API rewrites aliases server-side), but
+                          # the response is async and Vercel does not block
+                          # on reflection. The smoke stage only checks that
+                          # `/` returns 2xx/3xx — that probe will pass on
+                          # the previously promoted frontend too, so it
+                          # cannot be relied on to catch a stuck promote.
+                          # Poll the deployment substate authoritatively
+                          # here and FAIL if it never reaches PROMOTED
+                          # within a generous window (5 minutes after
+                          # accept). The pipeline must not advance to the
+                          # Release stage while the production alias is
+                          # still on the previous deployment.
+                          PROMOTE_DEADLINE=$((SECONDS + 300))
+                          while [ $SECONDS -lt $PROMOTE_DEADLINE ]; do
+                            if curl -sf -K "$AUTH_CONFIG" \
+                                "$API_BASE/v13/deployments/$DEPLOYMENT_ID?teamId=$TEAM_ID" \
+                                -o /tmp/vercel-deployment.json; then
+                              SUBSTATE=$($JQ -r '.readySubstate // ""' /tmp/vercel-deployment.json)
+                              echo "  deployment readySubstate=${SUBSTATE:-<none>}"
+                              if [ "$SUBSTATE" = "PROMOTED" ]; then
+                                echo "✓ Vercel production deployment promoted"
+                                exit 0
+                              fi
+                            fi
+                            sleep 5
+                          done
+                          echo "✗ Vercel accepted the promote API call but deployment $DEPLOYMENT_ID did not reach PROMOTED within 5 minutes."
+                          echo "  current substate (last poll): ${SUBSTATE:-<unknown>}"
+                          echo "  inspect at: https://vercel.com/$TEAM_ID/$PROJECT_REF (deployment id $DEPLOYMENT_ID)"
+                          echo "Failing the stage to prevent the Release stage from advancing on a stale production frontend."
+                          exit 1
+
+    # =====================================================================
+    # Stage 5 — Smoke test. Hit /healthz + /readyz on the api and / on the
+    # public host after the Vercel promotion. Non-2xx/3xx marks the
+    # pipeline failed (manual rollback is `kubectl rollout undo` for
+    # alice-api; Vercel rollback is promoting the previous green
+    # deployment — see docs/runbooks/superalice-cf.md).
+    # =====================================================================
+    - stage:
+        name: Smoke
+        identifier: smoke
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Smoke
+                  identifier: smoke
+                  type: ShellScript
+                  timeout: 5m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+                          fail=0
+                          for url in \
+                            "https://superalice-api.machine-pulse.net/healthz" \
+                            "https://superalice-api.machine-pulse.net/readyz" \
+                            "https://superalice.machine-pulse.net/" \
+                          ; do
+                            # No -k: all three URLs terminate TLS at
+                            # Cloudflare with a valid public cert. Verifying
+                            # the cert here means an expired/invalid CF/Vercel
+                            # edge cert fails the smoke instead of passing it.
+                            code=$(curl -s -o /dev/null -w "%{http_code}" "$url" || echo 000)
+                            echo "$code  $url"
+                            case "$code" in 2*|3*) ;; *) fail=1 ;; esac
+                          done
+                          exit "$fail"
+
+    # =====================================================================
+    # Stage 6 — Release. Two steps, both MarkAsSuccess on failure because
+    # the deploy has already happened and is healthy by this point —
+    # failing to write an annotation or push a tag must not regress the
+    # pipeline outcome.
+    #
+    #   1. Record Prod Image Tag — annotates deployment/alice-api
+    #      with alice.machine-pulse.net/last-prod-sha=<SHA>, providing the next run's
+    #      baseline.
+    #   2. Create GitHub Release — bumps from the latest v* tag (CLI and
+    #      service share one version series — see CLAUDE.md "CLI Release"),
+    #      uses an LLM to format release notes with hard rules against
+    #      fabricated PR numbers, falls back to the raw commit list when
+    #      LLM is unavailable, and creates a GitHub Release pointing at
+    #      the new SHA. The tag-create implicit in /releases POST triggers
+    #      .github/workflows/release.yml which handles CLI binaries
+    #      (S3 + bump latest.txt) and downstream Docker/desktop builds.
+    # =====================================================================
+    - stage:
+        name: Release
+        identifier: release
+        type: Custom
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Record Prod Image Tag
+                  identifier: record_prod_image_tag
+                  type: ShellScript
+                  timeout: 2m
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: MarkAsSuccess
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -o pipefail
+                          SERVICE="alice-api"
+                          NS=alice
+                          ANNOTATION_KEY="alice.machine-pulse.net/last-prod-sha"
+                          TAG="<+pipeline.variables.image_tag>"
+                          # Accept 7-40 hex chars — Alice's GHA pushes 12-char short SHAs.
+                          if ! printf '%s' "$TAG" | grep -qE '^[0-9a-f]{7,40}$'; then
+                            echo "WARN: image_tag '$TAG' is not a hex SHA; skipping annotation write"
+                            exit 0
+                          fi
+                          if kubectl -n "$NS" annotate deployment "$SERVICE" \
+                              "${ANNOTATION_KEY}=${TAG}" --overwrite; then
+                            echo "Annotated deployment/$SERVICE with ${ANNOTATION_KEY}=${TAG}"
+                          else
+                            echo "WARN: kubectl annotate failed — next run's change summary will fall back to image tag"
+                          fi
+
+              # Bump from the latest v* tag in the repo and create a Release.
+              # Because Alice's .github/workflows/release.yml fires on
+              # `push: tags: v*.*.*`, this implicitly triggers a full CLI
+              # release (S3 binaries, latest.txt bump, Docker, desktop).
+              # CHANGE_SUMMARY / RAW_COMMITS are injected as env vars so
+              # commit-message metacharacters can't break the shell parse.
+              - step:
+                  name: Create GitHub Release
+                  identifier: create_github_release
+                  type: ShellScript
+                  timeout: 5m
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: MarkAsSuccess
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    delegateSelectors:
+                      - alice-prod
+                    environmentVariables:
+                      - name: CHANGE_SUMMARY
+                        type: String
+                        value: <+pipeline.stages.approval_gate.spec.execution.steps.generate_summary.output.outputVariables.CHANGE_SUMMARY>
+                      - name: RAW_COMMITS
+                        type: String
+                        value: <+pipeline.stages.approval_gate.spec.execution.steps.generate_summary.output.outputVariables.RAW_COMMITS>
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -o pipefail
+
+                          OPENROUTER_KEY='<+secrets.getValue("openrouter_api_key")>'
+                          CURRENT_SHA="<+pipeline.variables.image_tag>"
+                          ORG="machinepulse-ai"
+                          REPO="alice-beta"
+                          LLM_MODEL="anthropic/claude-haiku-4-5"
+                          PRIVATE_KEY_VAL='<+secrets.getValue("account.mp_harness_private_key")>'
+
+                          # jq bootstrap — arch-aware (Graviton arm64).
+                          case "$(uname -m)" in
+                            aarch64|arm64)
+                              JQ_BIN=jq-linux-arm64
+                              JQ_SHA=4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5
+                              ;;
+                            *)
+                              JQ_BIN=jq-linux-amd64
+                              JQ_SHA=5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5
+                              ;;
+                          esac
+                          if [ ! -x /tmp/jq ] || \
+                             ! echo "$JQ_SHA  /tmp/jq" | sha256sum -c - >/dev/null 2>&1; then
+                            curl -sfL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/$JQ_BIN" -o /tmp/jq && \
+                              echo "$JQ_SHA  /tmp/jq" | sha256sum -c - && \
+                              chmod +x /tmp/jq
+                          fi
+                          JQ=/tmp/jq
+                          if [ ! -x "$JQ" ]; then
+                            echo "WARN: jq not available, skipping release creation"
+                            exit 0
+                          fi
+
+                          # Generate GitHub App installation token (same pattern as
+                          # generate_summary; token TTL is ~1h, comfortably within
+                          # this stage's wall time).
+                          APP_ID="3125495"
+                          INSTALL_ID="117359680"
+                          PEM_FILE=$(mktemp /tmp/gh-app-key-XXXXXXXX.pem)
+                          trap "rm -f $PEM_FILE" EXIT
+                          printf '%b' "$PRIVATE_KEY_VAL" > "$PEM_FILE"
+                          chmod 600 "$PEM_FILE"
+                          if ! head -1 "$PEM_FILE" | grep -q "BEGIN"; then
+                            echo "WARN: PEM file invalid, skipping release creation"
+                            exit 0
+                          fi
+                          NOW_JWT=$(date +%s)
+                          IAT=$((NOW_JWT - 60))
+                          EXP=$((NOW_JWT + 600))
+                          HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+                          PAYLOAD=$(printf '{"iss":"%s","iat":%d,"exp":%d}' "$APP_ID" "$IAT" "$EXP" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+                          SIGN_INPUT="$HEADER.$PAYLOAD"
+                          SIGNATURE=$(printf '%s' "$SIGN_INPUT" | openssl dgst -sha256 -sign "$PEM_FILE" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+                          JWT="$SIGN_INPUT.$SIGNATURE"
+                          GITHUB_TOKEN=$(curl -sf -X POST \
+                            -H "Authorization: Bearer $JWT" \
+                            -H "Accept: application/vnd.github+json" \
+                            "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" \
+                            | $JQ -r '.token')
+                          if [ -z "$GITHUB_TOKEN" ] || [ "$GITHUB_TOKEN" = "null" ]; then
+                            echo "WARN: Failed to generate GitHub token, skipping release creation"
+                            exit 0
+                          fi
+
+                          # Resolve short SHA → full 40-char SHA. POST /releases
+                          # target_commitish only accepts a 40-char SHA or a branch name;
+                          # the 12-char short SHA Alice's GHA pushes is rejected with
+                          # HTTP 422 "tag_name is not a valid tag" + "target_commitish invalid"
+                          # (the tag_name error is a knock-on from target_commitish being bad).
+                          FULL_SHA=$(curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+                            "https://api.github.com/repos/$ORG/$REPO/commits/$CURRENT_SHA" \
+                            | $JQ -r '.sha // ""')
+                          if [ -z "$FULL_SHA" ] || [ "${#FULL_SHA}" -ne 40 ]; then
+                            echo "WARN: failed to resolve $CURRENT_SHA to a 40-char SHA, skipping release"
+                            exit 0
+                          fi
+
+                          # Bump from the latest semver tag in the repo. CLI and prod
+                          # deploys share one v* series (see CLAUDE.md "CLI Release"),
+                          # so listing all tags and taking the lexicographically-correct
+                          # semver-max gives us a single counter that both sides advance.
+                          echo "=== Computing next tag ==="
+                          TAGS_JSON=$(curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+                            "https://api.github.com/repos/$ORG/$REPO/tags?per_page=100" || echo "[]")
+                          LATEST_TAG=$($JQ -r '
+                            [.[].name
+                              | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))]
+                            | sort_by(
+                                [ (capture("^v(?<x>[0-9]+)\\.(?<y>[0-9]+)\\.(?<z>[0-9]+)$") | (.x|tonumber), (.y|tonumber), (.z|tonumber)) ]
+                              )
+                            | last // ""' <<< "$TAGS_JSON")
+                          echo "Latest stable tag: ${LATEST_TAG:-<none>}"
+
+                          if [ -z "$LATEST_TAG" ]; then
+                            NEW_TAG="v0.1.0"
+                          else
+                            MAJOR=$(echo "$LATEST_TAG" | sed 's/^v//' | cut -d. -f1)
+                            MINOR=$(echo "$LATEST_TAG" | sed 's/^v//' | cut -d. -f2)
+                            PATCH=$(echo "$LATEST_TAG" | sed 's/^v//' | cut -d. -f3)
+                            NEW_TAG="v$MAJOR.$MINOR.$((PATCH + 1))"
+                          fi
+                          echo "New release: $NEW_TAG"
+
+                          # Verify the chosen tag doesn't already exist (race with a manual
+                          # `git tag` push). If it does, bump again. Bounded retry — if 5
+                          # bumps in a row collide something is structurally wrong.
+                          for _ in 1 2 3 4 5; do
+                            EXISTS=$(curl -s -o /dev/null -w '%{http_code}' \
+                              -H "Authorization: token $GITHUB_TOKEN" \
+                              "https://api.github.com/repos/$ORG/$REPO/git/ref/tags/$NEW_TAG")
+                            if [ "$EXISTS" = "404" ]; then break; fi
+                            echo "Tag $NEW_TAG already exists (HTTP $EXISTS); bumping again"
+                            MAJOR=$(echo "$NEW_TAG" | sed 's/^v//' | cut -d. -f1)
+                            MINOR=$(echo "$NEW_TAG" | sed 's/^v//' | cut -d. -f2)
+                            PATCH=$(echo "$NEW_TAG" | sed 's/^v//' | cut -d. -f3)
+                            NEW_TAG="v$MAJOR.$MINOR.$((PATCH + 1))"
+                          done
+                          # Exhausted all 5 attempts without finding a free tag — surface this
+                          # explicitly rather than letting POST /releases return 422 and logging
+                          # an unrelated-looking WARN. Five collisions in a row means either the
+                          # repo has runaway tag creation or the GitHub /tags listing is stale;
+                          # both warrant operator attention, not a silent skip.
+                          if [ "$EXISTS" != "404" ]; then
+                            echo "WARN: exhausted 5 tag-bump retries; last attempt $NEW_TAG still collides (HTTP $EXISTS). Skipping release creation."
+                            exit 0
+                          fi
+
+                          # LLM-format release notes with hard rules against fabricated PR
+                          # numbers; fall back to raw commit list if LLM is unavailable or
+                          # produces a hallucinated reference. (Same gate as Karpo — see
+                          # karpo-infra .../main-pipeline.yaml.tpl lines 850-897 for the
+                          # full rationale.)
+                          RELEASE_BODY=""
+                          if [ -n "$CHANGE_SUMMARY" ] && [ -n "$OPENROUTER_KEY" ]; then
+                            SYSTEM_PROMPT="You are a release note formatter. You will be given a list of git commits for a single repository. Reformat them into a GitHub release note.\n\nOutput format:\n## NEW_TAG\n\n### Added\n- <short description> (#<pr_number>)\n\n### Fixed\n- <short description> (#<pr_number>)\n\n### Changed\n- <short description> (#<pr_number>)\n\n**Full Changelog**: https://github.com/GITHUB_ORG/GITHUB_REPO/compare/PREV_TAG...NEW_TAG\n\nHARD RULES (violations will be detected and rejected):\n1. Only reference PR numbers that appear verbatim in the input commits. If a commit does not have a (#N) suffix, omit the PR number; do NOT invent one.\n2. Only reference services, repos, features, or file paths that appear verbatim in the input commits. Do NOT mention other repositories, services, or unrelated concepts from general knowledge.\n3. Categorize by conventional commit prefix: feat→Added, fix→Fixed, refactor/chore/perf/docs/ci→Changed. Skip a section entirely if it has no commits.\n4. Keep each line under 120 characters. One commit per line.\n5. Do not output a Risk section, an Attention section, or any preamble."
+
+                            SYSTEM_PROMPT=$(printf '%s' "$SYSTEM_PROMPT" | sed "s|GITHUB_ORG|$ORG|g;s|GITHUB_REPO|$REPO|g;s|PREV_TAG|$LATEST_TAG|g;s|NEW_TAG|$NEW_TAG|g")
+
+                            USER_CONTENT="Raw commit list for $REPO between $LATEST_TAG and $NEW_TAG:"$'\n\n'"$RAW_COMMITS"$'\n\n---\n\nSummarised context (may itself be imperfect — treat the raw list above as ground truth):'$'\n\n'"$CHANGE_SUMMARY"
+
+                            REQUEST=$($JQ -n \
+                              --arg model "$LLM_MODEL" \
+                              --arg system "$SYSTEM_PROMPT" \
+                              --arg user "$USER_CONTENT" \
+                              '{model: $model, messages: [{role: "system", content: $system}, {role: "user", content: $user}], temperature: 0, max_tokens: 1500}')
+
+                            LLM_RESP=$(curl -s "https://openrouter.ai/api/v1/chat/completions" \
+                              -H "Content-Type: application/json" \
+                              -H "Authorization: Bearer $OPENROUTER_KEY" \
+                              -d "$REQUEST" 2>/dev/null || echo "")
+
+                            if [ -n "$LLM_RESP" ]; then
+                              RELEASE_BODY=$($JQ -r '.choices[0].message.content // ""' <<< "$LLM_RESP" 2>/dev/null || echo "")
+                            fi
+
+                            # Post-LLM sanity check: every (#N) reference must appear in
+                            # RAW_COMMITS. Discard the LLM output if it fabricated one.
+                            if [ -n "$RELEASE_BODY" ]; then
+                              FABRICATED=""
+                              for pr in $(printf '%s' "$RELEASE_BODY" | grep -oE '#[0-9]+' | sort -u); do
+                                if ! printf '%s' "$RAW_COMMITS" | grep -qF "$pr"; then
+                                  FABRICATED="$FABRICATED $pr"
+                                fi
+                              done
+                              if [ -n "$FABRICATED" ]; then
+                                echo "WARN: LLM fabricated PR numbers:$FABRICATED"
+                                echo "WARN: discarding LLM output, falling back to raw commit list"
+                                RELEASE_BODY=""
+                              fi
+                            fi
+                          fi
+
+                          # Fallback: raw commit list (never passed through an LLM, so
+                          # ground-truth by construction).
+                          if [ -z "$RELEASE_BODY" ]; then
+                            RELEASE_BODY="## $NEW_TAG"$'\n\n'"$RAW_COMMITS"$'\n\n'"**Full Changelog**: https://github.com/$ORG/$REPO/compare/$LATEST_TAG...$NEW_TAG"
+                          fi
+
+                          echo "=== Release Notes ==="
+                          echo "$RELEASE_BODY"
+
+                          # POST /releases implicitly creates the tag via target_commitish.
+                          # That tag-create then fires .github/workflows/release.yml (push:tags
+                          # filter v*.*.*) → CLI binaries to S3, Docker images, desktop builds.
+                          RELEASE_PAYLOAD=$($JQ -n \
+                            --arg tag "$NEW_TAG" \
+                            --arg name "$NEW_TAG" \
+                            --arg body "$RELEASE_BODY" \
+                            --arg sha "$FULL_SHA" \
+                            '{tag_name: $tag, name: $name, body: $body, target_commitish: $sha, draft: false, prerelease: false}')
+
+                          HTTP_CODE=$(curl -s -o /tmp/release_resp.json -w '%{http_code}' -X POST \
+                            -H "Authorization: token $GITHUB_TOKEN" \
+                            -H "Accept: application/vnd.github+json" \
+                            "https://api.github.com/repos/$ORG/$REPO/releases" \
+                            -d "$RELEASE_PAYLOAD")
+
+                          if [ "$HTTP_CODE" = "201" ]; then
+                            RELEASE_URL=$($JQ -r '.html_url' /tmp/release_resp.json)
+                            echo "=== Release created: $RELEASE_URL ==="
+                          else
+                            echo "WARN: Release creation returned HTTP $HTTP_CODE"
+                            cat /tmp/release_resp.json
+                            echo "Release creation failed but not blocking deploy"
+                          fi
+                          rm -f /tmp/release_resp.json
+

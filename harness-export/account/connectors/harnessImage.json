@@ -1,0 +1,21 @@
+{
+  "name": "Harness GAR Connector",
+  "identifier": "harnessImage",
+  "description": "Harness internal connector",
+  "accountIdentifier": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "orgIdentifier": null,
+  "projectIdentifier": null,
+  "tags": {},
+  "type": "DockerRegistry",
+  "spec": {
+    "dockerRegistryUrl": "https://us-docker.pkg.dev/gar-prod-setup/harness-public",
+    "providerType": "Other",
+    "auth": {
+      "type": "Anonymous"
+    },
+    "delegateSelectors": [],
+    "executeOnDelegate": false,
+    "proxy": false,
+    "ignoreTestConnection": false
+  }
+}

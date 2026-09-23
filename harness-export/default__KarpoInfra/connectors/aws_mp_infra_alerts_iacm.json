@@ -1,0 +1,26 @@
+{
+  "name": "aws-mp-infra-alerts-iacm",
+  "identifier": "aws_mp_infra_alerts_iacm",
+  "description": "AWS connector for Harness IaCM — assumes mp-infra-alerts-harness-iacm role for terraform CD against environments/prod-aws/",
+  "accountIdentifier": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "orgIdentifier": "default",
+  "projectIdentifier": "KarpoInfra",
+  "tags": {},
+  "type": "Aws",
+  "spec": {
+    "credential": {
+      "crossAccountAccess": null,
+      "type": "OidcAuthentication",
+      "spec": {
+        "iamRoleArn": "arn:aws:iam::651527661132:role/mp-infra-alerts-harness-iacm",
+        "oidcSessionTagKeys": null
+      },
+      "region": "us-east-1"
+    },
+    "awsSdkClientBackOffStrategyOverride": null,
+    "delegateSelectors": [],
+    "executeOnDelegate": false,
+    "proxy": false,
+    "ignoreTestConnection": false
+  }
+}

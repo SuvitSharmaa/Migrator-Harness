@@ -1,0 +1,51 @@
+    service:
+      name: karpo-im-rpc
+      identifier: karpo_im_rpc
+      orgIdentifier: default
+      projectIdentifier: KarpoInfra
+      serviceDefinition:
+        type: Kubernetes
+        spec:
+          variables:
+            - name: kustomize_folder
+              type: String
+              value: <+input>
+          manifests:
+            - manifest:
+                identifier: kustomize_manifest
+                type: Kustomize
+                spec:
+                  store:
+                    type: Github
+                    spec:
+                      connectorRef: MPHarness
+                      repoName: karpo-deploy
+                      gitFetchType: Branch
+                      branch: main
+                      folderPath: <+serviceVariables.kustomize_folder>
+                  patchesPaths: []
+                  pluginPath: ""
+            - manifest:
+                identifier: image_tag_patch
+                type: KustomizePatches
+                spec:
+                  store:
+                    type: Github
+                    spec:
+                      connectorRef: MPHarness
+                      repoName: karpo-deploy
+                      gitFetchType: Branch
+                      branch: main
+                      paths:
+                        - overlays/prod/per-service/karpo-im-rpc/patch-image.yaml
+          artifacts:
+            primary:
+              sources:
+                - identifier: ecr_image
+                  type: Ecr
+                  spec:
+                    connectorRef: aws_karpo
+                    imagePath: karpo-im-rpc
+                    region: us-east-1
+                    tag: <+input>
+

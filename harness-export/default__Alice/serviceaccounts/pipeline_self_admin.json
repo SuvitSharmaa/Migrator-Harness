@@ -1,0 +1,9 @@
+{
+  "identifier": "pipeline_self_admin",
+  "name": "pipeline-self-admin",
+  "email": "pipeline-self-admin-alice@service.harness.io",
+  "description": "SA used by alice-prod-deploy pipeline to abort prior ApprovalWaiting / Running executions of the same pipeline.",
+  "tags": {
+    "managedByTerraform": ""
+  }
+}

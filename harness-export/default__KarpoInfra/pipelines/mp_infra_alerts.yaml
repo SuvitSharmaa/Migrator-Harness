@@ -1,0 +1,191 @@
+pipeline:
+  name: mp-infra-alerts
+  identifier: mp_infra_alerts
+  projectIdentifier: KarpoInfra
+  orgIdentifier: default
+  tags:
+    iacm: ""
+
+  # ===========================================================================
+  # Two stages, one per workspace, fixed shape (no parameterisation per the
+  # mentor-Garrison "fixed-stage chain" decision documented in karpo's
+  # MAC-1002). prod-aws first; prod-gcp second; failureStrategy stops the
+  # chain on any error.
+  #
+  # Each stage runs init + plan + apply in the same build pod (no separate
+  # apply stage because there's no approval gate between plan and apply).
+  # Karpo's design splits plan and apply across stages because their cost
+  # gate sits in between; we don't have that gate.
+  # ===========================================================================
+  stages:
+    - stage:
+        name: prod-aws
+        identifier: prod_aws
+        type: IACM
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          workspace: iacm_mp_infra_alerts_prod_aws
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              # Reuses karpo's prod EKS build connector and karpo's namespace
+              # (intentional — IaCM build pod's K8s SA doesn't authenticate to
+              # AWS/GCP, so namespace separation has limited security value
+              # and creating a dedicated namespace would require EKS access
+              # entries the engineer running bootstrap doesn't have).
+              connectorRef: k8s_prod
+              namespace: karpo
+          execution:
+            steps:
+              # Pre-build Lambda artifacts. Without this, archive_file hashes
+              # only tracked source (handler.py + requirements.txt) — the
+              # null_resource provisioner doesn't re-fire on a fresh checkout
+              # because its trigger value matches state, so pip-installed
+              # deps never make it into the zip. Mirrors the equivalent step
+              # in .github/workflows/terraform.yml (added in PR #36 to fix
+              # the same divergence for GHA-side plan).
+              - step:
+                  type: Run
+                  name: Pre-build Lambda artifacts
+                  identifier: prebuild_lambda
+                  timeout: 5m
+                  spec:
+                    connectorRef: dockerhub_anonymous
+                    image: python:3.12-slim
+                    shell: Bash
+                    command: |
+                      set -euo pipefail
+                      for mod in aws-cost datadog-alerts; do
+                        cp -r lib/feishu_notifier/feishu_notifier \
+                              modules/$mod/lambda/feishu_notifier
+                        pip3 install -r modules/$mod/lambda/requirements.txt \
+                              -t modules/$mod/lambda \
+                              --quiet --no-user --no-compile \
+                              --platform manylinux2014_x86_64 \
+                              --implementation cp \
+                              --python-version 3.12 \
+                              --only-binary=:all:
+                      done
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Init
+                  identifier: init
+                  timeout: 10m
+                  spec:
+                    command: init
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Plan
+                  identifier: plan
+                  timeout: 30m
+                  spec:
+                    command: plan
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Apply
+                  identifier: apply
+                  timeout: 30m
+                  # Default step behavior already short-circuits on any
+                  # upstream failure inside the stage. Step-level `when`
+                  # is only needed for cross-stage conditions (which would
+                  # use `stageStatus`, not `pipelineStatus`). No approval
+                  # gate before this step → no override needed.
+                  spec:
+                    command: apply
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+
+    - stage:
+        name: prod-gcp
+        identifier: prod_gcp
+        type: IACM
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          workspace: iacm_mp_infra_alerts_prod_gcp
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8s_prod
+              namespace: karpo
+          execution:
+            steps:
+              # Pre-build Cloud Function source. gcp-vertex-ops's Cloud Function
+              # installs requirements.txt server-side at deploy time, so we only
+              # need the shared lib copy here (no pip install). Without this the
+              # archive_file hash differs from the deployed bundle on every
+              # fresh-checkout plan.
+              - step:
+                  type: Run
+                  name: Pre-build Cloud Function source
+                  identifier: prebuild_function_source
+                  timeout: 2m
+                  spec:
+                    connectorRef: dockerhub_anonymous
+                    image: alpine:3.19
+                    shell: Sh
+                    command: |
+                      set -eu
+                      cp -r lib/feishu_notifier/feishu_notifier \
+                            modules/gcp-vertex-ops/function-source/feishu_notifier
+                    resources:
+                      limits:
+                        memory: 256Mi
+                        cpu: 250m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Init
+                  identifier: init
+                  timeout: 10m
+                  spec:
+                    command: init
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Plan
+                  identifier: plan
+                  timeout: 30m
+                  spec:
+                    command: plan
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Apply
+                  identifier: apply
+                  timeout: 30m
+                  spec:
+                    command: apply
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+

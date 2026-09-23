@@ -1,0 +1,84 @@
+{
+  "created": 1778579501564,
+  "description": "Harness IaCM workspace for environments/prod-aws",
+  "name": "iacm-mp-infra-alerts-prod-aws",
+  "account": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "org": "default",
+  "project": "KarpoInfra",
+  "identifier": "iacm_mp_infra_alerts_prod_aws",
+  "updated": 1778579501564,
+  "provisioner": "terraform",
+  "provisioner_version": "1.5.7",
+  "provisioner_data": {
+    "cost_breakdown": "",
+    "cost_diff": "",
+    "modules": "4d19158b-aecb-4aae-a3ec-52ea3db9aac4",
+    "plan_human": "09ae6790-0204-4d88-a9c4-f2f232cfa342",
+    "plan_raw": "",
+    "providers": "",
+    "state_human": "148f534e-8b12-409b-9676-5f24a740dfa1",
+    "state_raw": "2ecba4d6-cda4-4f7a-a441-d6cdd92594d3"
+  },
+  "terraform_plan_json": "09ae6790-0204-4d88-a9c4-f2f232cfa342",
+  "terraform_state": "2ecba4d6-cda4-4f7a-a441-d6cdd92594d3",
+  "terraform_state_json": "148f534e-8b12-409b-9676-5f24a740dfa1",
+  "provider_connector": "aws_mp_infra_alerts_iacm",
+  "repository": "mp-infra-alerts",
+  "repository_branch": "main",
+  "repository_connector": "MPHarness",
+  "repository_path": "environments/prod-aws",
+  "repository_submodules": "false",
+  "status": "active",
+  "cost_breakdown_json": "",
+  "cost_diff_json": "",
+  "modules_json": "4d19158b-aecb-4aae-a3ec-52ea3db9aac4",
+  "providers_json": "",
+  "cost_estimation_enabled": false,
+  "terraform_variables": {
+    "datadog_api_key": {
+      "key": "datadog_api_key",
+      "value": "datadog_api_key",
+      "value_type": "secret",
+      "created": 1778579501564,
+      "updated": 1778579501564
+    },
+    "datadog_app_key": {
+      "key": "datadog_app_key",
+      "value": "datadog_app_key",
+      "value_type": "secret",
+      "created": 1778579501564,
+      "updated": 1778579501564
+    },
+    "feishu_routing_config": {
+      "key": "feishu_routing_config",
+      "value": "feishu_routing_config",
+      "value_type": "secret",
+      "created": 1778579501564,
+      "updated": 1778579501564
+    }
+  },
+  "environment_variables": {},
+  "terraform_variable_files": null,
+  "budget": null,
+  "backend_locked": false,
+  "default_pipelines": {
+    "plan": {
+      "project_pipeline": "karpo_infra"
+    }
+  },
+  "state_checksum": "85205c03c84eec2f89acb9c09625df98387d3f42d19f776677d924f7cb0a19f0",
+  "variable_sets": null,
+  "tags": {
+    "iacm": "",
+    "workspace": "prod_aws"
+  },
+  "provider_connectors": [
+    {
+      "connector_ref": "aws_mp_infra_alerts_iacm",
+      "type": "aws",
+      "created": 1778579501564,
+      "updated": 1778579501564
+    }
+  ],
+  "prune_sensitive_data": false
+}

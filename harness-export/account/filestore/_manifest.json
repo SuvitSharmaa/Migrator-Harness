@@ -1,0 +1,56 @@
+[
+  {
+    "identifier": "deployment_yaml",
+    "name": "deployment.yaml",
+    "type": "FILE",
+    "parentIdentifier": "templates",
+    "mimeType": null,
+    "fileUsage": "MANIFEST_FILE",
+    "description": "Sample k8s manifest file created by Harness"
+  },
+  {
+    "identifier": "namespace_yaml",
+    "name": "namespace.yaml",
+    "type": "FILE",
+    "parentIdentifier": "templates",
+    "mimeType": null,
+    "fileUsage": "MANIFEST_FILE",
+    "description": "Sample k8s manifest file created by Harness"
+  },
+  {
+    "identifier": "sample_k8s_manifests",
+    "name": "Sample K8s Manifests",
+    "type": "FOLDER",
+    "parentIdentifier": "Root",
+    "mimeType": null,
+    "fileUsage": null,
+    "description": "Sample k8s manifest folder created by Harness"
+  },
+  {
+    "identifier": "service_yaml",
+    "name": "service.yaml",
+    "type": "FILE",
+    "parentIdentifier": "templates",
+    "mimeType": null,
+    "fileUsage": "MANIFEST_FILE",
+    "description": "Sample k8s manifest file created by Harness"
+  },
+  {
+    "identifier": "templates",
+    "name": "templates",
+    "type": "FOLDER",
+    "parentIdentifier": "sample_k8s_manifests",
+    "mimeType": null,
+    "fileUsage": null,
+    "description": "Sample k8s manifest folder created by Harness"
+  },
+  {
+    "identifier": "values_yaml",
+    "name": "values.yaml",
+    "type": "FILE",
+    "parentIdentifier": "sample_k8s_manifests",
+    "mimeType": null,
+    "fileUsage": "MANIFEST_FILE",
+    "description": "Sample k8s manifest file created by Harness"
+  }
+]

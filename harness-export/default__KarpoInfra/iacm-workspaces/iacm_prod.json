@@ -1,0 +1,62 @@
+{
+  "created": 1778492921609,
+  "description": "Harness IaCM workspace for environments/prod",
+  "name": "iacm-prod",
+  "account": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "org": "default",
+  "project": "KarpoInfra",
+  "identifier": "iacm_prod",
+  "updated": 1778492921609,
+  "provisioner": "terraform",
+  "provisioner_version": "1.5.7",
+  "provisioner_data": {
+    "cost_breakdown": "f5fe922d-f74d-4cec-9fac-26ac31af8fd3",
+    "cost_diff": "48b89ac0-fdcf-45ce-a872-6949d6a6c3f7",
+    "modules": "ffbe7c5f-75f2-4d22-a4de-f46c1ec37081",
+    "plan_human": "f59346ad-6892-4cef-bc7f-08c328071468",
+    "plan_raw": "",
+    "providers": "",
+    "state_human": "b591be28-35b4-46c1-8c68-6b2c71e81b3d",
+    "state_raw": "2a2ec40b-9558-4b60-bde7-e88761828db2"
+  },
+  "terraform_plan_json": "f59346ad-6892-4cef-bc7f-08c328071468",
+  "terraform_state": "2a2ec40b-9558-4b60-bde7-e88761828db2",
+  "terraform_state_json": "b591be28-35b4-46c1-8c68-6b2c71e81b3d",
+  "provider_connector": "aws_karpo_iacm",
+  "repository": "karpo-infra",
+  "repository_branch": "main",
+  "repository_connector": "MPHarness",
+  "repository_path": "environments/prod",
+  "repository_submodules": "false",
+  "status": "active",
+  "cost_breakdown_json": "f5fe922d-f74d-4cec-9fac-26ac31af8fd3",
+  "cost_diff_json": "48b89ac0-fdcf-45ce-a872-6949d6a6c3f7",
+  "modules_json": "ffbe7c5f-75f2-4d22-a4de-f46c1ec37081",
+  "providers_json": "",
+  "cost_estimation_enabled": true,
+  "terraform_variables": null,
+  "environment_variables": null,
+  "terraform_variable_files": null,
+  "budget": null,
+  "backend_locked": false,
+  "default_pipelines": {
+    "plan": {
+      "project_pipeline": "karpo_infra"
+    }
+  },
+  "state_checksum": "f14ef9e94824a84749749c4a454e95abc4c4660548aab85ed374d6a229920bfe",
+  "variable_sets": null,
+  "tags": {
+    "iacm": "",
+    "workspace": "prod"
+  },
+  "provider_connectors": [
+    {
+      "connector_ref": "aws_karpo_iacm",
+      "type": "aws",
+      "created": 1778492921609,
+      "updated": 1778492921609
+    }
+  ],
+  "prune_sensitive_data": false
+}

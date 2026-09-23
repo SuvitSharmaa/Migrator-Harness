@@ -1,0 +1,17 @@
+{
+  "name": "datadog-karpo",
+  "identifier": "datadog_karpo",
+  "description": "Datadog connector for Continuous Verification",
+  "accountIdentifier": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "orgIdentifier": "default",
+  "projectIdentifier": "KarpoInfra",
+  "tags": {},
+  "type": "Datadog",
+  "spec": {
+    "url": "https://us5.datadoghq.com/api/",
+    "applicationKeyRef": "dd_cv_app_key",
+    "apiKeyRef": "dd_cv_api_key",
+    "delegateSelectors": [],
+    "ignoreTestConnection": false
+  }
+}

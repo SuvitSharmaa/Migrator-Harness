@@ -1,0 +1,26 @@
+{
+  "name": "aws-alice-iacm",
+  "identifier": "aws_alice_iacm",
+  "description": "AWS connector for Harness IaCM — assumes alice-harness-iacm for terraform CD against the alice-prod workspace.",
+  "accountIdentifier": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "orgIdentifier": "default",
+  "projectIdentifier": "Alice",
+  "tags": {},
+  "type": "Aws",
+  "spec": {
+    "credential": {
+      "crossAccountAccess": null,
+      "type": "OidcAuthentication",
+      "spec": {
+        "iamRoleArn": "arn:aws:iam::651527661132:role/alice-harness-iacm",
+        "oidcSessionTagKeys": null
+      },
+      "region": "ap-southeast-1"
+    },
+    "awsSdkClientBackOffStrategyOverride": null,
+    "delegateSelectors": [],
+    "executeOnDelegate": false,
+    "proxy": false,
+    "ignoreTestConnection": false
+  }
+}

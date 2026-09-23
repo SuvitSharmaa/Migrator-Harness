@@ -1,0 +1,48 @@
+service:
+  name: alice-api-staging
+  identifier: alice_api_staging
+  orgIdentifier: default
+  projectIdentifier: Alice
+  serviceDefinition:
+    type: Kubernetes
+    spec:
+      manifests:
+        - manifest:
+            identifier: kustomize_overlay
+            type: Kustomize
+            spec:
+              store:
+                type: Github
+                spec:
+                  connectorRef: MPHarness_alice
+                  repoName: alice-beta
+                  gitFetchType: Branch
+                  branch: main
+                  folderPath: infra/deploy/overlays/staging
+              patchesPaths: []
+              pluginPath: ""
+        - manifest:
+            identifier: image_tag_patch
+            type: KustomizePatches
+            spec:
+              store:
+                type: Github
+                spec:
+                  connectorRef: MPHarness_alice
+                  repoName: alice-beta
+                  gitFetchType: Branch
+                  branch: main
+                  paths:
+                    - infra/deploy/overlays/staging/patch-image.yaml
+      artifacts:
+        primary:
+          primaryArtifactRef: <+input>
+          sources:
+            - identifier: ecr_alice_api
+              type: Ecr
+              spec:
+                connectorRef: aws_alice_ci
+                imagePath: alice-api
+                region: ap-southeast-1
+                tag: <+input>
+

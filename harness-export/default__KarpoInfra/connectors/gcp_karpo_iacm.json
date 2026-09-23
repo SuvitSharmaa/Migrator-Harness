@@ -1,0 +1,25 @@
+{
+  "name": "gcp-karpo-iacm",
+  "identifier": "gcp_karpo_iacm",
+  "description": "GCP connector for Harness IaCM — Workload Identity Federation impersonating terraform-ci-apply SA for terraform CD on shared/staging/prod GCP resources.",
+  "accountIdentifier": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "orgIdentifier": "default",
+  "projectIdentifier": "KarpoInfra",
+  "tags": {},
+  "type": "Gcp",
+  "spec": {
+    "credential": {
+      "type": "OidcAuthentication",
+      "spec": {
+        "workloadPoolId": "github-actions-pool",
+        "providerId": "harness",
+        "gcpProjectId": "281769743206",
+        "serviceAccountEmail": "terraform-ci-apply@machinepulse-gracly.iam.gserviceaccount.com"
+      }
+    },
+    "delegateSelectors": [],
+    "executeOnDelegate": false,
+    "proxy": false,
+    "ignoreTestConnection": false
+  }
+}

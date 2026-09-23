@@ -1,0 +1,753 @@
+pipeline:
+  name: karpo-infra
+  identifier: karpo_infra
+  projectIdentifier: KarpoInfra
+  orgIdentifier: default
+  tags:
+    iacm: ""
+
+  # ===========================================================================
+  # Fixed-stage chain — terminal 9-stage form (Shared + Staging + Prod).
+  # Each stack's stage trio mirrors the others: init+plan+cost-anomaly Run,
+  # conditional HarnessApproval, init+apply.
+  #
+  # Within each trio the Approval Gate is skipped (auto-apply) when the cost
+  # diff vs the previous applied state is below
+  # `iacm_cost_anomaly_threshold_pct` (currently 25 for all stacks);
+  # otherwise it sends a Feishu approval card via Argus and blocks the
+  # following Apply stage until a human approves. Per mentor (MAC-1002):
+  # PR review is the primary control, Harness approval is reserved for
+  # anomalies.
+  #
+  # Why a separate Approval stage rather than inline `IACMApproval`: the
+  # IaCM-native `IACMApproval` step has only `autoApprove: false` in spec —
+  # no `approvers`/`userGroups`/`serviceAccounts`, so it can't be wired to
+  # Argus → Lark (Argus calls back via `account.LarkApprover` SA, which
+  # Harness 400s on unless that SA is on the step's `serviceAccounts` list).
+  # ===========================================================================
+  stages:
+    # =======================================================================
+    # Shared — Init / Plan + Cost Anomaly Check
+    # =======================================================================
+    - stage:
+        name: Shared Init Plan
+        identifier: shared_init_plan
+        type: IACM
+        # Harness IaCM stages require failureStrategies. MarkAsFailure
+        # (vs StageRollback) — for IaCM there's nothing meaningful to
+        # roll back at the stage level: terraform plan persists nothing,
+        # and a failed apply will leave partial state that has to be
+        # reviewed manually anyway.
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        spec:
+          workspace: iacm_shared
+          # Run pipeline build pods on the prod EKS cluster.
+          # Cloud (Harness Hosted VM) is not enabled on this account.
+          # Staging EKS is currently at AWS-account vCPU quota (64) so the
+          # autoscaler cannot add a node big enough for the build pod —
+          # using the prod EKS cluster as compute (no new node needed,
+          # current 3 nodes have ample free CPU/memory). AWS credentials
+          # still flow through the karpo-harness-iacm OIDC connector, so
+          # the build pod's K8s service account is irrelevant to AWS auth.
+          # TODO: switch back to `k8s_staging` after the staging EKS vCPU
+          # quota is increased OR after a dedicated IaCM build cluster is
+          # provisioned.
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8s_prod
+              namespace: karpo
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Init
+                  identifier: init
+                  timeout: 10m
+                  spec:
+                    command: init
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Plan
+                  identifier: plan
+                  timeout: 30m
+                  spec:
+                    command: plan
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              # =================================================================
+              # Cost Anomaly Check — read Harness IaCM's persisted Infracost
+              # output for this workspace's latest plan, compute the monthly
+              # cost change %, export it as a stage output that the next
+              # stage's `when:` condition reads.
+              #
+              # API surface (verified via PAT probe):
+              #   GET /iacm/api/orgs/{org}/projects/{project}/workspaces/{ws}
+              #     → JSON, `cost_breakdown_json` field is the UUID of the
+              #       latest cost breakdown blob
+              #   GET /iacm/api/orgs/{org}/projects/{project}/workspaces/{ws}/data/{uuid}
+              #     → Infracost JSON, includes `totalMonthlyCost`,
+              #       `pastTotalMonthlyCost`, `diffTotalMonthlyCost`. We
+              #       compute % from (current - past) / past so the
+              #       threshold is relative to actual baseline.
+              #
+              # Auth: Harness SA token (`harness_sa_api_key`) provisioned in
+              # `sa_pipeline_self_admin.tf` — already used by prod CD's
+              # abort-prior-pending step, has `_project_admin` role which
+              # covers IaCM read.
+              #
+              # Edge cases:
+              #   - `pastTotalMonthlyCost == 0` (first apply): export
+              #     `cost_change_pct=0` so approval auto-skips. Subsequent
+              #     applies use the fresh baseline.
+              #   - `cost_breakdown_json` UUID empty (workspace has never
+              #     run a plan): same fallback — export 0, skip approval.
+              #   - API call fails (network / token / 5xx): export 0 and
+              #     proceed (fail-OPEN — PR review is primary control).
+              # =================================================================
+              - step:
+                  type: Run
+                  name: Cost Anomaly Check
+                  identifier: cost_anomaly_check
+                  timeout: 5m
+                  spec:
+                    shell: Sh
+                    image: alpine:3.19
+                    connectorRef: dockerhub_anonymous
+                    envVariables:
+                      HARNESS_API_BASE: https://machinepulse.harness.io
+                      HARNESS_ACCOUNT: <+account.identifier>
+                      HARNESS_ORG: default
+                      HARNESS_PROJECT: KarpoInfra
+                      HARNESS_WORKSPACE: iacm_shared
+                      ANOMALY_THRESHOLD_PCT: "25"
+                      HARNESS_SA_KEY: <+secrets.getValue("harness_sa_api_key")>
+                    command: |
+                      # `shell: Sh` runs `/bin/sh` which on alpine:3.19 is
+                      # BusyBox ash. ash does not implement `-o pipefail`,
+                      # so we use plain `set -u` here. We don't actually
+                      # need pipefail anyway: every pipe lives inside a
+                      # `$(...)` assignment whose downstream consumer
+                      # explicitly handles the empty-string case.
+                      set -u
+
+                      # Alpine 3.19 ships with neither curl nor jq; both are
+                      # in the default community repos and install in <2s.
+                      apk add --no-cache curl jq >/dev/null
+
+                      WS_URL="${HARNESS_API_BASE}/iacm/api/orgs/${HARNESS_ORG}/projects/${HARNESS_PROJECT}/workspaces/${HARNESS_WORKSPACE}?accountIdentifier=${HARNESS_ACCOUNT}"
+
+                      WS_JSON=$(curl -sS --max-time 30 -H "x-api-key: ${HARNESS_SA_KEY}" "$WS_URL" || echo "")
+                      if [ -z "$WS_JSON" ]; then
+                        echo "WARN: workspace API call failed — fail-open with cost_change_pct=0"
+                        cost_change_pct=0
+                      else
+                        COST_UUID=$(printf '%s' "$WS_JSON" | jq -r '.cost_breakdown_json // empty')
+                        if [ -z "$COST_UUID" ]; then
+                          echo "WARN: cost_breakdown_json UUID not in workspace metadata (workspace never ran plan?) — cost_change_pct=0"
+                          cost_change_pct=0
+                        else
+                          DATA_URL="${HARNESS_API_BASE}/iacm/api/orgs/${HARNESS_ORG}/projects/${HARNESS_PROJECT}/workspaces/${HARNESS_WORKSPACE}/data/${COST_UUID}?accountIdentifier=${HARNESS_ACCOUNT}"
+                          COST_JSON=$(curl -sS --max-time 30 -H "x-api-key: ${HARNESS_SA_KEY}" "$DATA_URL" || echo "")
+                          if [ -z "$COST_JSON" ]; then
+                            echo "WARN: cost data API call failed — cost_change_pct=0"
+                            cost_change_pct=0
+                          else
+                            CURR=$(printf '%s' "$COST_JSON" | jq -r '.totalMonthlyCost // 0')
+                            PAST=$(printf '%s' "$COST_JSON" | jq -r '.pastTotalMonthlyCost // 0')
+                            echo "current monthly cost (USD): $CURR"
+                            echo "past monthly cost (USD):    $PAST"
+                            cost_change_pct=$(awk -v c="$CURR" -v p="$PAST" 'BEGIN { if (p+0 == 0) print 0; else printf "%.0f", (c-p)/p*100 }')
+                          fi
+                        fi
+                      fi
+
+                      echo "cost_change_pct=$cost_change_pct"
+                      echo "anomaly_threshold_pct=$ANOMALY_THRESHOLD_PCT"
+                      export cost_change_pct
+                    outputVariables:
+                      - name: cost_change_pct
+                        type: String
+                        value: cost_change_pct
+                    resources:
+                      limits:
+                        memory: 256Mi
+                        cpu: 200m
+
+    # =======================================================================
+    # Shared — Approval Gate (skipped unless cost diff ≥ threshold %)
+    #
+    # Argus posts a Feishu approval card on `WaitingForUserAction` (see the
+    # `notificationRules` block at the bottom of this template). Clicking
+    # Approve in Lark triggers Argus → Harness API approve_execution call
+    # via the `account.LarkApprover` SA listed in `serviceAccounts` below;
+    # Harness 400s if that SA isn't whitelisted on the step.
+    #
+    # `when:` condition is JEXL (Harness expression). String-to-int compare
+    # is safe here because the cost-anomaly Run step always exports a
+    # numeric string.
+    #
+    # Approver list mirrors prod CD (modules/service-pipeline/
+    # main-pipeline.yaml.tpl:364) so the same Feishu users + LarkApprover
+    # SA path that already works for service deploys works here too.
+    # =======================================================================
+    - stage:
+        name: Shared Approval Gate
+        identifier: shared_approval_gate
+        type: Approval
+        # Approval rejection / timeout fails the pipeline (skips the
+        # following Apply stage as a side effect of pipelineStatus !=
+        # Success). MarkAsFailure here keeps the run visible in the
+        # failure dashboard rather than silently aborting.
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.stages.shared_init_plan.spec.execution.steps.cost_anomaly_check.output.outputVariables.cost_change_pct> >= 25
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Approve Apply
+                  identifier: approve_apply
+                  type: HarnessApproval
+                  timeout: 72h
+                  spec:
+                    approvalMessage: |
+                      **Workspace:** iacm_shared
+                      **Cost change:** <+pipeline.stages.shared_init_plan.spec.execution.steps.cost_anomaly_check.output.outputVariables.cost_change_pct>% (threshold 25%)
+                      **Pipeline run:** <+pipeline.executionUrl>
+
+                      Review the plan output and IaCM Cost Change Estimation
+                      tab in the Harness UI before approving. Approval
+                      triggers `terraform apply` against AWS.
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      minimumCount: 1
+                      # Block the principal that triggered the pipeline
+                      # (currently the GHA service-account token from
+                      # SSM `/karpo/harness/api-key-v2`) from also approving
+                      # its own apply. Defence-in-depth.
+                      disallowPipelineExecutor: true
+                      userGroups:
+                        - _project_all_users
+                        - account.ResearchDevelopment
+                      serviceAccounts:
+                        - account.LarkApprover
+                    isAutoRejectEnabled: false
+
+    # =======================================================================
+    # Shared — Apply
+    #
+    # IaCM's apply command consumes the plan persisted to workspace storage
+    # by the previous stage, so no re-plan happens here. Init is included
+    # because each IACM stage runs in a fresh build pod and terraform apply
+    # needs the provider plugins available locally even when a saved plan
+    # is used.
+    #
+    # `when: pipelineStatus: Success` is defence-in-depth: Harness's default
+    # cross-stage advance already stops on failure, but an explicit guard
+    # keeps Apply gated even if a future edit to the Approval Gate's
+    # `when:` block accidentally relaxes that requirement. Skipped stages
+    # (the Approval Gate when cost is below threshold) count as Success
+    # for `pipelineStatus`, so the auto-apply path still works.
+    # =======================================================================
+    - stage:
+        name: Shared Apply
+        identifier: shared_apply
+        type: IACM
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        when:
+          pipelineStatus: Success
+        spec:
+          workspace: iacm_shared
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8s_prod
+              namespace: karpo
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Init
+                  identifier: init
+                  timeout: 10m
+                  spec:
+                    command: init
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Apply
+                  identifier: apply
+                  timeout: 30m
+                  spec:
+                    command: apply
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+
+    # =======================================================================
+    # Staging — Init / Plan + Cost Anomaly Check
+    # =======================================================================
+    - stage:
+        name: Staging Init Plan
+        identifier: staging_init_plan
+        type: IACM
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        when:
+          pipelineStatus: Success
+        spec:
+          workspace: iacm_staging
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8s_prod
+              namespace: karpo
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Init
+                  identifier: init
+                  timeout: 10m
+                  spec:
+                    command: init
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Plan
+                  identifier: plan
+                  timeout: 30m
+                  spec:
+                    command: plan
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              # Same cost anomaly check as Shared Init Plan, but reading
+              # iacm_staging workspace's persisted Infracost output instead.
+              - step:
+                  type: Run
+                  name: Cost Anomaly Check
+                  identifier: cost_anomaly_check
+                  timeout: 5m
+                  spec:
+                    shell: Sh
+                    image: alpine:3.19
+                    connectorRef: dockerhub_anonymous
+                    envVariables:
+                      HARNESS_API_BASE: https://machinepulse.harness.io
+                      HARNESS_ACCOUNT: <+account.identifier>
+                      HARNESS_ORG: default
+                      HARNESS_PROJECT: KarpoInfra
+                      HARNESS_WORKSPACE: iacm_staging
+                      ANOMALY_THRESHOLD_PCT: "25"
+                      HARNESS_SA_KEY: <+secrets.getValue("harness_sa_api_key")>
+                    command: |
+                      set -u
+                      apk add --no-cache curl jq >/dev/null
+
+                      WS_URL="${HARNESS_API_BASE}/iacm/api/orgs/${HARNESS_ORG}/projects/${HARNESS_PROJECT}/workspaces/${HARNESS_WORKSPACE}?accountIdentifier=${HARNESS_ACCOUNT}"
+
+                      WS_JSON=$(curl -sS --max-time 30 -H "x-api-key: ${HARNESS_SA_KEY}" "$WS_URL" || echo "")
+                      if [ -z "$WS_JSON" ]; then
+                        echo "WARN: workspace API call failed — fail-open with cost_change_pct=0"
+                        cost_change_pct=0
+                      else
+                        COST_UUID=$(printf '%s' "$WS_JSON" | jq -r '.cost_breakdown_json // empty')
+                        if [ -z "$COST_UUID" ]; then
+                          echo "WARN: cost_breakdown_json UUID not in workspace metadata — cost_change_pct=0"
+                          cost_change_pct=0
+                        else
+                          DATA_URL="${HARNESS_API_BASE}/iacm/api/orgs/${HARNESS_ORG}/projects/${HARNESS_PROJECT}/workspaces/${HARNESS_WORKSPACE}/data/${COST_UUID}?accountIdentifier=${HARNESS_ACCOUNT}"
+                          COST_JSON=$(curl -sS --max-time 30 -H "x-api-key: ${HARNESS_SA_KEY}" "$DATA_URL" || echo "")
+                          if [ -z "$COST_JSON" ]; then
+                            echo "WARN: cost data API call failed — cost_change_pct=0"
+                            cost_change_pct=0
+                          else
+                            CURR=$(printf '%s' "$COST_JSON" | jq -r '.totalMonthlyCost // 0')
+                            PAST=$(printf '%s' "$COST_JSON" | jq -r '.pastTotalMonthlyCost // 0')
+                            echo "current monthly cost (USD): $CURR"
+                            echo "past monthly cost (USD):    $PAST"
+                            cost_change_pct=$(awk -v c="$CURR" -v p="$PAST" 'BEGIN { if (p+0 == 0) print 0; else printf "%.0f", (c-p)/p*100 }')
+                          fi
+                        fi
+                      fi
+
+                      echo "cost_change_pct=$cost_change_pct"
+                      echo "anomaly_threshold_pct=$ANOMALY_THRESHOLD_PCT"
+                      export cost_change_pct
+                    outputVariables:
+                      - name: cost_change_pct
+                        type: String
+                        value: cost_change_pct
+                    resources:
+                      limits:
+                        memory: 256Mi
+                        cpu: 200m
+
+    # =======================================================================
+    # Staging — Approval Gate (skipped unless cost diff ≥ threshold %)
+    # Same approver list / Argus webhook as Shared Approval Gate.
+    # =======================================================================
+    - stage:
+        name: Staging Approval Gate
+        identifier: staging_approval_gate
+        type: Approval
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.stages.staging_init_plan.spec.execution.steps.cost_anomaly_check.output.outputVariables.cost_change_pct> >= 25
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Approve Apply
+                  identifier: approve_apply
+                  type: HarnessApproval
+                  timeout: 72h
+                  spec:
+                    approvalMessage: |
+                      **Workspace:** iacm_staging
+                      **Cost change:** <+pipeline.stages.staging_init_plan.spec.execution.steps.cost_anomaly_check.output.outputVariables.cost_change_pct>% (threshold 25%)
+                      **Pipeline run:** <+pipeline.executionUrl>
+
+                      Review the plan output and IaCM Cost Change Estimation
+                      tab in the Harness UI before approving. Approval
+                      triggers `terraform apply` against AWS.
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      minimumCount: 1
+                      disallowPipelineExecutor: true
+                      userGroups:
+                        - _project_all_users
+                        - account.ResearchDevelopment
+                      serviceAccounts:
+                        - account.LarkApprover
+                    isAutoRejectEnabled: false
+
+    # =======================================================================
+    # Staging — Apply
+    # =======================================================================
+    - stage:
+        name: Staging Apply
+        identifier: staging_apply
+        type: IACM
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        when:
+          pipelineStatus: Success
+        spec:
+          workspace: iacm_staging
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8s_prod
+              namespace: karpo
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Init
+                  identifier: init
+                  timeout: 10m
+                  spec:
+                    command: init
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Apply
+                  identifier: apply
+                  timeout: 30m
+                  spec:
+                    command: apply
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+
+    # =======================================================================
+    # Prod — Init / Plan + Cost Anomaly Check
+    # =======================================================================
+    - stage:
+        name: Prod Init Plan
+        identifier: prod_init_plan
+        type: IACM
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        when:
+          pipelineStatus: Success
+        spec:
+          workspace: iacm_prod
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8s_prod
+              namespace: karpo
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Init
+                  identifier: init
+                  timeout: 10m
+                  spec:
+                    command: init
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Plan
+                  identifier: plan
+                  timeout: 30m
+                  spec:
+                    command: plan
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              # Same cost anomaly check as Shared/Staging Init Plan, but
+              # reading iacm_prod workspace's persisted Infracost output.
+              - step:
+                  type: Run
+                  name: Cost Anomaly Check
+                  identifier: cost_anomaly_check
+                  timeout: 5m
+                  spec:
+                    shell: Sh
+                    image: alpine:3.19
+                    connectorRef: dockerhub_anonymous
+                    envVariables:
+                      HARNESS_API_BASE: https://machinepulse.harness.io
+                      HARNESS_ACCOUNT: <+account.identifier>
+                      HARNESS_ORG: default
+                      HARNESS_PROJECT: KarpoInfra
+                      HARNESS_WORKSPACE: iacm_prod
+                      ANOMALY_THRESHOLD_PCT: "25"
+                      HARNESS_SA_KEY: <+secrets.getValue("harness_sa_api_key")>
+                    command: |
+                      set -u
+                      apk add --no-cache curl jq >/dev/null
+
+                      WS_URL="${HARNESS_API_BASE}/iacm/api/orgs/${HARNESS_ORG}/projects/${HARNESS_PROJECT}/workspaces/${HARNESS_WORKSPACE}?accountIdentifier=${HARNESS_ACCOUNT}"
+
+                      WS_JSON=$(curl -sS --max-time 30 -H "x-api-key: ${HARNESS_SA_KEY}" "$WS_URL" || echo "")
+                      if [ -z "$WS_JSON" ]; then
+                        echo "WARN: workspace API call failed — fail-open with cost_change_pct=0"
+                        cost_change_pct=0
+                      else
+                        COST_UUID=$(printf '%s' "$WS_JSON" | jq -r '.cost_breakdown_json // empty')
+                        if [ -z "$COST_UUID" ]; then
+                          echo "WARN: cost_breakdown_json UUID not in workspace metadata — cost_change_pct=0"
+                          cost_change_pct=0
+                        else
+                          DATA_URL="${HARNESS_API_BASE}/iacm/api/orgs/${HARNESS_ORG}/projects/${HARNESS_PROJECT}/workspaces/${HARNESS_WORKSPACE}/data/${COST_UUID}?accountIdentifier=${HARNESS_ACCOUNT}"
+                          COST_JSON=$(curl -sS --max-time 30 -H "x-api-key: ${HARNESS_SA_KEY}" "$DATA_URL" || echo "")
+                          if [ -z "$COST_JSON" ]; then
+                            echo "WARN: cost data API call failed — cost_change_pct=0"
+                            cost_change_pct=0
+                          else
+                            CURR=$(printf '%s' "$COST_JSON" | jq -r '.totalMonthlyCost // 0')
+                            PAST=$(printf '%s' "$COST_JSON" | jq -r '.pastTotalMonthlyCost // 0')
+                            echo "current monthly cost (USD): $CURR"
+                            echo "past monthly cost (USD):    $PAST"
+                            cost_change_pct=$(awk -v c="$CURR" -v p="$PAST" 'BEGIN { if (p+0 == 0) print 0; else printf "%.0f", (c-p)/p*100 }')
+                          fi
+                        fi
+                      fi
+
+                      echo "cost_change_pct=$cost_change_pct"
+                      echo "anomaly_threshold_pct=$ANOMALY_THRESHOLD_PCT"
+                      export cost_change_pct
+                    outputVariables:
+                      - name: cost_change_pct
+                        type: String
+                        value: cost_change_pct
+                    resources:
+                      limits:
+                        memory: 256Mi
+                        cpu: 200m
+
+    # =======================================================================
+    # Prod — Approval Gate (skipped unless cost diff ≥ threshold %)
+    # Same approver list / Argus webhook as Shared/Staging Approval Gate.
+    # =======================================================================
+    - stage:
+        name: Prod Approval Gate
+        identifier: prod_approval_gate
+        type: Approval
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.stages.prod_init_plan.spec.execution.steps.cost_anomaly_check.output.outputVariables.cost_change_pct> >= 25
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Approve Apply
+                  identifier: approve_apply
+                  type: HarnessApproval
+                  timeout: 72h
+                  spec:
+                    approvalMessage: |
+                      **Workspace:** iacm_prod
+                      **Cost change:** <+pipeline.stages.prod_init_plan.spec.execution.steps.cost_anomaly_check.output.outputVariables.cost_change_pct>% (threshold 25%)
+                      **Pipeline run:** <+pipeline.executionUrl>
+
+                      Review the plan output and IaCM Cost Change Estimation
+                      tab in the Harness UI before approving. Approval
+                      triggers `terraform apply` against AWS.
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      minimumCount: 1
+                      disallowPipelineExecutor: true
+                      userGroups:
+                        - _project_all_users
+                        - account.ResearchDevelopment
+                      serviceAccounts:
+                        - account.LarkApprover
+                    isAutoRejectEnabled: false
+
+    # =======================================================================
+    # Prod — Apply
+    # =======================================================================
+    - stage:
+        name: Prod Apply
+        identifier: prod_apply
+        type: IACM
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure
+        when:
+          pipelineStatus: Success
+        spec:
+          workspace: iacm_prod
+          # WARNING (Codex PR #234 Issue 2): self-mutating cluster risk.
+          # This Apply runs the build pod on prod EKS via k8s_prod, but
+          # iacm_prod terraform stack ALSO manages this same EKS cluster
+          # (module "eks" in environments/prod/main.tf) and its node
+          # groups. An apply that touches the cluster or its nodes can
+          # evict / terminate its own runner mid-apply, leaving prod
+          # state half-changed and requiring manual recovery.
+          # Mitigation during the verification period:
+          #   * For PRs that change `module "eks"` / `aws_eks_node_group`
+          #     / `aws_eks_addon` resources in environments/prod, route
+          #     through the legacy `apply change prod` GHA path (still
+          #     alive in .github/workflows/terraform.yml) — runs from a
+          #     GitHub-hosted runner outside the cluster.
+          # Permanent fix tracked separately: provision a dedicated IaCM
+          # build cluster (or enable Harness Hosted VM on this account).
+          # When that lands, switch this connectorRef.
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8s_prod
+              namespace: karpo
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Init
+                  identifier: init
+                  timeout: 10m
+                  spec:
+                    command: init
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: Apply
+                  identifier: apply
+                  timeout: 30m
+                  spec:
+                    command: apply
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 500m
+
+  # ===========================================================================
+  # Notification rule — fires when the HarnessApproval step in any approval
+  # stage moves the pipeline into WaitingForUserAction. Argus receives the
+  # webhook and posts a Feishu approval card; clicking Approve in Feishu
+  # calls back to Harness via `account.LarkApprover` SA (listed in the
+  # step's serviceAccounts).
+  #
+  # URL + bearer-token secret are the SAME values used by prod CD's
+  # main-pipeline.yaml.tpl:942. Switch to argus.machinepulse.ai once
+  # Cloudflare access is restored.
+  # ===========================================================================
+  notificationRules:
+    - name: Argus IaCM Approval Webhook
+      identifier: argus_iacm_approval_webhook
+      pipelineEvents:
+        - type: WaitingForUserAction
+      notificationMethod:
+        type: Webhook
+        spec:
+          webhookUrl: https://52-3-143-233.sslip.io/webhook/harness/prod-approval
+          headers:
+            Authorization: 'Bearer <+secrets.getValue("argus_harness_webhook_secret")>'
+      enabled: true
+

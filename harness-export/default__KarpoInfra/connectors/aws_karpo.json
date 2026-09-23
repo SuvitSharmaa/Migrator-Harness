@@ -1,0 +1,26 @@
+{
+  "name": "aws-karpo",
+  "identifier": "aws_karpo",
+  "description": "AWS connector for ECR push via OIDC (MachinePulse prod-5)",
+  "accountIdentifier": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "orgIdentifier": "default",
+  "projectIdentifier": "KarpoInfra",
+  "tags": {},
+  "type": "Aws",
+  "spec": {
+    "credential": {
+      "crossAccountAccess": null,
+      "type": "OidcAuthentication",
+      "spec": {
+        "iamRoleArn": "arn:aws:iam::651527661132:role/karpo-harness-ci-v2",
+        "oidcSessionTagKeys": null
+      },
+      "region": "us-east-1"
+    },
+    "awsSdkClientBackOffStrategyOverride": null,
+    "delegateSelectors": [],
+    "executeOnDelegate": false,
+    "proxy": false,
+    "ignoreTestConnection": false
+  }
+}

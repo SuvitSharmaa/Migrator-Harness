@@ -1,0 +1,42 @@
+{
+  "name": "MP-Harness-alice",
+  "identifier": "MPHarness_alice",
+  "description": "GitHub App connector targeting machinepulse-ai/alice-beta for IaCM workspace clones.",
+  "accountIdentifier": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "orgIdentifier": "default",
+  "projectIdentifier": "Alice",
+  "tags": {},
+  "type": "Github",
+  "spec": {
+    "url": "https://github.com/machinepulse-ai",
+    "validationRepo": "alice-beta",
+    "authentication": {
+      "type": "Http",
+      "spec": {
+        "type": "GithubApp",
+        "spec": {
+          "installationId": "117359680",
+          "applicationId": "3125495",
+          "installationIdRef": null,
+          "applicationIdRef": null,
+          "privateKeyRef": "account.mp_harness_private_key"
+        }
+      }
+    },
+    "apiAccess": {
+      "type": "GithubApp",
+      "spec": {
+        "installationId": "117359680",
+        "applicationId": "3125495",
+        "installationIdRef": null,
+        "applicationIdRef": null,
+        "privateKeyRef": "account.mp_harness_private_key"
+      }
+    },
+    "delegateSelectors": [],
+    "executeOnDelegate": false,
+    "proxy": false,
+    "ignoreTestConnection": false,
+    "type": "Account"
+  }
+}

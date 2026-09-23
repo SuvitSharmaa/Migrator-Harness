@@ -1,0 +1,14 @@
+infrastructureDefinition:
+  name: prod-eks
+  identifier: prod_eks
+  orgIdentifier: default
+  projectIdentifier: KarpoInfra
+  environmentRef: prod
+  deploymentType: Kubernetes
+  type: KubernetesDirect
+  spec:
+    connectorRef: k8s_prod
+    namespace: karpo
+    releaseName: release-<+INFRA_KEY_SHORT_ID>
+  allowSimultaneousDeployments: false
+

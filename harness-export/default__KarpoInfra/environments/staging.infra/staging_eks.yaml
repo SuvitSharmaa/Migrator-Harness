@@ -1,0 +1,14 @@
+infrastructureDefinition:
+  name: staging-eks
+  identifier: staging_eks
+  orgIdentifier: default
+  projectIdentifier: KarpoInfra
+  environmentRef: staging
+  deploymentType: Kubernetes
+  type: KubernetesDirect
+  spec:
+    connectorRef: k8s_staging
+    namespace: karpo
+    releaseName: release-<+INFRA_KEY_SHORT_ID>
+  allowSimultaneousDeployments: false
+

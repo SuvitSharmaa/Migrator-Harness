@@ -1,0 +1,21 @@
+{
+  "name": "dockerhub-anonymous",
+  "identifier": "dockerhub_anonymous",
+  "description": "Anonymous Docker Hub for IaCM Run-step base images (alpine, etc.)",
+  "accountIdentifier": "Mjk0OGU1Y2QtOTc4MS00OD",
+  "orgIdentifier": "default",
+  "projectIdentifier": "KarpoInfra",
+  "tags": {},
+  "type": "DockerRegistry",
+  "spec": {
+    "dockerRegistryUrl": "https://index.docker.io/v2/",
+    "providerType": "DockerHub",
+    "auth": {
+      "type": "Anonymous"
+    },
+    "delegateSelectors": [],
+    "executeOnDelegate": false,
+    "proxy": false,
+    "ignoreTestConnection": false
+  }
+}
