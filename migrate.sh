@@ -4,8 +4,11 @@
 #
 # Wires export.sh -> secrets.sh -> import.sh together in the right order and
 # with the right environment variables. Asks whether you want to migrate an
-# entire account (mirrors every org/project, as before) or a single project
-# into a (possibly differently-named) project in another account.
+# entire account (mirrors every org/project, as before), a single project
+# into a (possibly differently-named) project in another account, or restore
+# a project that's already been DELETED by reconstructing it from Harness's
+# Audit Trail instead of a live export (see restore-from-audit.sh) — the
+# lookback-days prompt for that mode comes first, before anything else.
 #
 # Hybrid prompting: any variable already set in the environment is used as-is
 # and never prompted for, so this also works fully non-interactively, e.g.:
@@ -72,27 +75,54 @@ echo
 
 # ---- 1. mode ---------------------------------------------------------------
 MIGRATION_MODE="${MIGRATION_MODE:-}"
-while [[ "$MIGRATION_MODE" != "account" && "$MIGRATION_MODE" != "project" ]]; do
-  read -r -p "Migrate an entire (a)ccount or a single (p)roject? [a/p]: " choice
+while [[ "$MIGRATION_MODE" != "account" && "$MIGRATION_MODE" != "project" && "$MIGRATION_MODE" != "restore" ]]; do
+  read -r -p "Migrate an entire (a)ccount, a single (p)roject, or (r)estore a deleted project from the audit trail? [a/p/r]: " choice
   case "$choice" in
     a|A|account) MIGRATION_MODE="account" ;;
     p|P|project) MIGRATION_MODE="project" ;;
-    *) echo "Please enter 'a' or 'p'." ;;
+    r|R|restore) MIGRATION_MODE="restore" ;;
+    *) echo "Please enter 'a', 'p', or 'r'." ;;
   esac
 done
 export MIGRATION_MODE
 echo "Mode: $MIGRATION_MODE"
 echo
 
+# Restore mode asks for the lookback window right away, before anything
+# else — the deleted project's own live APIs are gone, so everything from
+# here on reads from the audit trail instead of a real export.
+if [[ "$MIGRATION_MODE" == "restore" ]]; then
+  ask LOOKBACK_DAYS "How many days back should I search the audit trail for the deletion?" "30"
+  # You'll get a per-entity review file (restore-review.csv) before anything
+  # is actually restored, where each git-linked pipeline/template gets its
+  # own Branch cell — this is just a pre-fill suggestion for that cell when
+  # the audit trail didn't capture a branch itself, saving you from typing
+  # the same branch into every row by hand if most of them share one. You
+  # can still override any individual row in the file before saving it.
+  ask GIT_RESTORE_BRANCH "Suggested git branch to pre-fill for git-linked pipelines/templates in the review file (blank = leave those cells blank)" ""
+  echo
+fi
+
+PROJECT_LIKE=0
+[[ "$MIGRATION_MODE" == "project" || "$MIGRATION_MODE" == "restore" ]] && PROJECT_LIKE=1
+
 # ---- 2. source --------------------------------------------------------------
 echo "-- Source account --"
 ask SRC_ACCOUNT_ID    "Source account ID"
 ask SRC_BASE_URL      "Source base URL (SaaS usually needs the /gateway suffix, e.g. https://app.harness.io/gateway)" "https://prod5.harness.io/gateway"
-ask SRC_HARNESS_TOKEN "Source token (UI session JWT or API key, read access)" "" 1
+if [[ "$MIGRATION_MODE" == "restore" ]]; then
+  ask SRC_HARNESS_TOKEN "Source token (needs audit-trail read access)" "" 1
+else
+  ask SRC_HARNESS_TOKEN "Source token (UI session JWT or API key, read access)" "" 1
+fi
 echo
 
-if [[ "$MIGRATION_MODE" == "project" ]]; then
-  echo "-- Source project --"
+if [[ "$PROJECT_LIKE" -eq 1 ]]; then
+  if [[ "$MIGRATION_MODE" == "restore" ]]; then
+    echo "-- Deleted project (identifiers from BEFORE it was deleted) --"
+  else
+    echo "-- Source project --"
+  fi
   ask SRC_ORG     "Source org identifier"
   ask SRC_PROJECT "Source project identifier"
   echo
@@ -105,7 +135,7 @@ ask TGT_BASE_URL      "Target base URL (SaaS usually needs the /gateway suffix, 
 ask TGT_HARNESS_TOKEN "Target token (API key pat./sat. recommended)" "" 1
 echo
 
-if [[ "$MIGRATION_MODE" == "project" ]]; then
+if [[ "$PROJECT_LIKE" -eq 1 ]]; then
   echo "-- Target project (press Enter to mirror the source identifiers) --"
   ask TGT_ORG          "Target org identifier" "$SRC_ORG"
   ask TGT_PROJECT      "Target project identifier" "$SRC_PROJECT"
@@ -114,7 +144,23 @@ if [[ "$MIGRATION_MODE" == "project" ]]; then
 fi
 
 # ---- 4. misc ----------------------------------------------------------------
-ask OUT_DIR "Local export directory" "./harness-export"
+# Default to a fresh, per-run directory rather than a shared "./harness-export"
+# — reusing the same dir across runs leaves stale project/account/org-scope
+# data behind (export.sh only ever adds to what's there, never cleans up),
+# which can silently mix into a later run or make import.sh refuse to proceed
+# ("contains N project scopes, expected exactly one") only after you've
+# already spent time re-exporting. Timestamp sorts chronologically; only
+# used as the DEFAULT, so `ask` still skips this entirely if OUT_DIR is
+# already set via env var.
+RUN_STAMP="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo run)"
+if [[ "$MIGRATION_MODE" == "restore" ]]; then
+  DEFAULT_OUT_DIR="./harness-export/${RUN_STAMP}__restore_${SRC_ORG}_${SRC_PROJECT}__to__${TGT_ORG}_${TGT_PROJECT}"
+elif [[ "$MIGRATION_MODE" == "project" ]]; then
+  DEFAULT_OUT_DIR="./harness-export/${RUN_STAMP}__${SRC_ORG}_${SRC_PROJECT}__to__${TGT_ORG}_${TGT_PROJECT}"
+else
+  DEFAULT_OUT_DIR="./harness-export/${RUN_STAMP}__account"
+fi
+ask OUT_DIR "Local export directory" "$DEFAULT_OUT_DIR"
 if [[ -z "${DRY_RUN:-}" ]]; then
   if confirm "Dry-run secrets/import first (preview only, no writes to the target)?"; then
     DRY_RUN=1
@@ -125,38 +171,53 @@ fi
 export DRY_RUN
 
 # ---- 5. summary + confirm ---------------------------------------------------
+STEP1_LABEL="export.sh"
+[[ "$MIGRATION_MODE" == "restore" ]] && STEP1_LABEL="restore-from-audit.sh"
+
 echo "=== Plan ==="
 echo "  Mode:            $MIGRATION_MODE"
+if [[ "$MIGRATION_MODE" == "restore" ]]; then
+  echo "  Lookback:        $LOOKBACK_DAYS days"
+  echo "  Git fallback:    ${GIT_RESTORE_BRANCH:-(none — skip git-linked entities with no captured branch)}"
+fi
 echo "  Source account:  $SRC_ACCOUNT_ID @ $SRC_BASE_URL (token: $(mask "$SRC_HARNESS_TOKEN"))"
-[[ "$MIGRATION_MODE" == "project" ]] && echo "  Source project:  $SRC_ORG/$SRC_PROJECT"
+[[ "$PROJECT_LIKE" -eq 1 ]] && echo "  Source project:  $SRC_ORG/$SRC_PROJECT"
 echo "  Target account:  $TGT_ACCOUNT_ID @ $TGT_BASE_URL (token: $(mask "$TGT_HARNESS_TOKEN"))"
-if [[ "$MIGRATION_MODE" == "project" ]]; then
+if [[ "$PROJECT_LIKE" -eq 1 ]]; then
   echo "  Target project:  $TGT_ORG/$TGT_PROJECT${TGT_PROJECT_NAME:+ (name: $TGT_PROJECT_NAME)}"
 fi
 echo "  Export dir:      $OUT_DIR"
 echo "  Dry run:         $DRY_RUN"
 echo
-confirm "Proceed with export -> secrets -> import?" || { echo "Aborted."; exit 1; }
+confirm "Proceed with $STEP1_LABEL -> secrets -> import?" || { echo "Aborted."; exit 1; }
 echo
 
 LOG_DIR="$OUT_DIR/_migrate-logs"
 mkdir -p "$LOG_DIR"
 
-# ---- 6. export ---------------------------------------------------------------
-EXPORT_ENV=(HARNESS_TOKEN="$SRC_HARNESS_TOKEN" SRC_ACCOUNT_ID="$SRC_ACCOUNT_ID" SRC_BASE_URL="$SRC_BASE_URL" OUT_DIR="$OUT_DIR")
-[[ "$MIGRATION_MODE" == "project" ]] && EXPORT_ENV+=(SRC_ORG="$SRC_ORG" SRC_PROJECT="$SRC_PROJECT")
-run_step "1/3 export.sh (source -> $OUT_DIR)" "$LOG_DIR/export.log" \
-  env "${EXPORT_ENV[@]}" "$SCRIPT_DIR/export.sh" || exit 1
+# ---- 6. export / restore -----------------------------------------------------
+if [[ "$MIGRATION_MODE" == "restore" ]]; then
+  RESTORE_ENV=(HARNESS_TOKEN="$SRC_HARNESS_TOKEN" SRC_ACCOUNT_ID="$SRC_ACCOUNT_ID" SRC_BASE_URL="$SRC_BASE_URL" \
+    SRC_ORG="$SRC_ORG" SRC_PROJECT="$SRC_PROJECT" LOOKBACK_DAYS="$LOOKBACK_DAYS" \
+    GIT_RESTORE_BRANCH="${GIT_RESTORE_BRANCH:-}" OUT_DIR="$OUT_DIR")
+  run_step "1/3 restore-from-audit.sh (source audit trail -> $OUT_DIR)" "$LOG_DIR/restore.log" \
+    env "${RESTORE_ENV[@]}" "$SCRIPT_DIR/restore-from-audit.sh" || exit 1
+else
+  EXPORT_ENV=(HARNESS_TOKEN="$SRC_HARNESS_TOKEN" SRC_ACCOUNT_ID="$SRC_ACCOUNT_ID" SRC_BASE_URL="$SRC_BASE_URL" OUT_DIR="$OUT_DIR")
+  [[ "$MIGRATION_MODE" == "project" ]] && EXPORT_ENV+=(SRC_ORG="$SRC_ORG" SRC_PROJECT="$SRC_PROJECT")
+  run_step "1/3 export.sh (source -> $OUT_DIR)" "$LOG_DIR/export.log" \
+    env "${EXPORT_ENV[@]}" "$SCRIPT_DIR/export.sh" || exit 1
+fi
 
 # ---- 7. secrets ---------------------------------------------------------------
 SECRETS_ENV=(HARNESS_TOKEN="$TGT_HARNESS_TOKEN" TGT_ACCOUNT_ID="$TGT_ACCOUNT_ID" TGT_BASE_URL="$TGT_BASE_URL" IN_DIR="$OUT_DIR" DRY_RUN="$DRY_RUN")
-[[ "$MIGRATION_MODE" == "project" ]] && SECRETS_ENV+=(TGT_ORG="$TGT_ORG" TGT_PROJECT="$TGT_PROJECT")
+[[ "$PROJECT_LIKE" -eq 1 ]] && SECRETS_ENV+=(TGT_ORG="$TGT_ORG" TGT_PROJECT="$TGT_PROJECT")
 run_step "2/3 secrets.sh (placeholder secrets -> target)" "$LOG_DIR/secrets.log" \
   env "${SECRETS_ENV[@]}" "$SCRIPT_DIR/secrets.sh" || exit 1
 
 # ---- 8. import ---------------------------------------------------------------
 IMPORT_ENV=(HARNESS_TOKEN="$TGT_HARNESS_TOKEN" TGT_ACCOUNT_ID="$TGT_ACCOUNT_ID" TGT_BASE_URL="$TGT_BASE_URL" IN_DIR="$OUT_DIR" DRY_RUN="$DRY_RUN")
-[[ "$MIGRATION_MODE" == "project" ]] && IMPORT_ENV+=(TGT_ORG="$TGT_ORG" TGT_PROJECT="$TGT_PROJECT" TGT_PROJECT_NAME="$TGT_PROJECT_NAME")
+[[ "$PROJECT_LIKE" -eq 1 ]] && IMPORT_ENV+=(TGT_ORG="$TGT_ORG" TGT_PROJECT="$TGT_PROJECT" TGT_PROJECT_NAME="$TGT_PROJECT_NAME")
 run_step "3/3 import.sh ($OUT_DIR -> target)" "$LOG_DIR/import.log" \
   env "${IMPORT_ENV[@]}" "$SCRIPT_DIR/import.sh" || exit 1
 

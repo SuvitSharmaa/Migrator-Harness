@@ -113,7 +113,13 @@ req() {
     printf '    OK   %s (%s)\n' "$label" "$code"; PASS=$((PASS+1)); return 0
   fi
   # Already-exists -> let caller try update by returning special code 9.
+  # Print the actual response even here — this used to be silent, which
+  # meant a real failure that merely happened to contain a matching phrase
+  # (or a genuine conflict for a reason other than "the record exists")
+  # was invisible; you'd only ever see the SECOND call's (the update
+  # attempt's) error, which can be misleading about the real cause.
   if echo "$resp" | grep -qiE 'already exists|duplicate|DUPLICATE_FIELD'; then
+    printf '    (exists) %s (%s) %s -- trying update\n' "$label" "$code" "$(echo "$resp" | jq -r '.message // .responseMessages[0].message // empty' 2>/dev/null | head -c 160)"
     return 9
   fi
   printf '    FAIL %s (%s) %s\n' "$label" "$code" "$(echo "$resp" | jq -r '.message // .responseMessages[0].message // empty' 2>/dev/null | head -c 160)" >&2
@@ -248,6 +254,7 @@ upsert_iacm_workspace() {
   resp="$(cat "$tmp")"; rm -f "$tmp"
   if [[ "$code" =~ ^2 ]]; then printf '    OK   %s (%s)\n' "$label" "$code"; PASS=$((PASS+1)); return 0; fi
   if echo "$resp" | grep -qiE 'already exists|duplicate|exists'; then
+    printf '    (exists) %s (%s) %s -- trying update\n' "$label" "$code" "$(echo "$resp" | jq -r '.message // empty' 2>/dev/null | head -c 160)"
     tmp="$(mktemp)"
     code="$(curl -s -o "$tmp" -w '%{http_code}' -X PUT "$base/$id?routingId=$ACC" "${HI[@]}" --data-binary "$body")"
     resp="$(cat "$tmp")"; rm -f "$tmp"
@@ -268,7 +275,16 @@ SCDIRS=()
 [[ -d "$IN/account" ]] && SCDIRS+=(account)
 while IFS= read -r d; do
   SCDIRS+=("$(basename "$d")")
-done < <(find "$IN" -maxdepth 1 -type d -name '*__*' | sort)
+done < <(find "$IN" -mindepth 1 -maxdepth 1 -type d -name '*__*' | sort)
+
+# Bash 3.2 (the shipped /bin/bash on macOS) throws "unbound variable" under
+# `set -u` for "${ARR[@]}" (and "${ARR[*]}") on a genuinely EMPTY array —
+# fixed in bash 4.4+, but this repo targets 3.2. Every expansion below is
+# guarded by a length check first; don't remove those guards.
+if [[ "${#SCDIRS[@]}" -eq 0 ]]; then
+  echo "no scope directories found under '$IN' — nothing to import (wrong IN_DIR, or an empty export?)" >&2
+  exit 1
+fi
 
 if [[ "$PROJECT_MODE" -eq 1 ]]; then
   PROJDIRS=(); OTHERDIRS=()
@@ -279,11 +295,17 @@ if [[ "$PROJECT_MODE" -eq 1 ]]; then
     esac
   done
   if [[ "${#PROJDIRS[@]}" -ne 1 ]]; then
-    echo "TGT_ORG/TGT_PROJECT set but '$IN' contains ${#PROJDIRS[@]} project scope(s) (${PROJDIRS[*]:-none}) — project-mode import expects exactly one (re-export with SRC_ORG/SRC_PROJECT set)" >&2
+    proj_list="none"; [[ "${#PROJDIRS[@]}" -gt 0 ]] && proj_list="${PROJDIRS[*]}"
+    echo "TGT_ORG/TGT_PROJECT set but '$IN' contains ${#PROJDIRS[@]} project scope(s) ($proj_list) — project-mode import expects exactly one (re-export with SRC_ORG/SRC_PROJECT set)" >&2
     exit 1
   fi
-  SCDIRS=("${OTHERDIRS[@]}" "${PROJDIRS[@]}")
-  echo "project mode: ${PROJDIRS[0]} -> $TGT_ORG/$TGT_PROJECT${OTHERDIRS[*]:+ (plus referenced account-/org-scope dependencies: ${OTHERDIRS[*]})}"
+  if [[ "${#OTHERDIRS[@]}" -gt 0 ]]; then
+    SCDIRS=("${OTHERDIRS[@]}" "${PROJDIRS[@]}")
+    echo "project mode: ${PROJDIRS[0]} -> $TGT_ORG/$TGT_PROJECT (plus referenced account-/org-scope dependencies: ${OTHERDIRS[*]})"
+  else
+    SCDIRS=("${PROJDIRS[@]}")
+    echo "project mode: ${PROJDIRS[0]} -> $TGT_ORG/$TGT_PROJECT"
+  fi
 fi
 echo "Scope dirs: ${SCDIRS[*]}"
 
@@ -336,6 +358,30 @@ for SCDIR in "${SCDIRS[@]}"; do
     [[ $? -eq 9 ]] && req PUT "$BASE/template/api/templates/update/$tid/$tver?$tqs&routingId=$ACC" yaml "$tbody" "template/$tid/$tver (update)"
   done
 
+  # git-linked templates (audit-trail restore only — a sidecar written by
+  # restore-from-audit.sh when a deleted template's MOVE_TO_GIT history was
+  # found, instead of a normal .yaml file). Mirrors the pipeline case above,
+  # which is CONFIRMED via a real HAR capture of Harness's "Import From Git"
+  # UI action (a genuinely separate endpoint from create — see the pipeline
+  # comment for the full trail of why storeType=REMOTE-on-create was wrong).
+  # The template's own import endpoint/body shape is EXTRAPOLATED from that
+  # confirmed pipeline shape (same param names, parallel /template/api path)
+  # — not independently verified. If this fails, check the response text
+  # for the actual expected shape before assuming the pipeline pattern
+  # applies exactly.
+  for f in "$IN/$SCDIR"/templates/*.remote.json; do [[ -e "$f" ]] || continue
+    tqs="$(scope_qs "$SC")"
+    base="$(basename "$f" .remote.json)"; tid="${base%__*}"; tver="${base##*__}"
+    connectorRef="$(jq -r '.connectorRef' "$f")"; repoName="$(jq -r '.repoName' "$f")"
+    filePath="$(jq -r '.filePath' "$f")"; branch="$(jq -r '.branch // ""' "$f")"
+    importqs="connectorRef=$connectorRef&isHarnessCodeRepo=false&repoName=$repoName&branch=$branch&filePath=$filePath"
+    req POST "$BASE/template/api/templates/import?$tqs&$importqs&routingId=$ACC" json '{"templateDescription":""}' "template/$tid/$tver (git-import)"
+    if [[ $? -eq 9 ]]; then
+      echo "    SKIP template/$tid/$tver (git-import) (already exists in target — this script doesn't re-import an already-imported git-linked template; delete it in target first if you need to re-run)"
+      SKIP=$((SKIP+1))
+    fi
+  done
+
   # connectors (JSON, wrap "connector") — skip Harness built-ins
   for f in "$IN/$SCDIR"/connectors/*.json; do [[ -e "$f" ]] || continue
     cid="$(basename "$f" .json)"
@@ -379,6 +425,33 @@ for SCDIR in "${SCDIRS[@]}"; do
     body="$(rewrite_scope_yaml "$f" "pipeline" "$porg" "$pproj")"; pid="$(basename "$f" .yaml)"
     req POST "$BASE/pipeline/api/pipelines/v2?$qs&routingId=$ACC" yaml "$body" "pipeline/$pid"
     [[ $? -eq 9 ]] && req PUT "$BASE/pipeline/api/pipelines/v2/$pid?$qs&routingId=$ACC" yaml "$body" "pipeline/$pid (update)"
+  done
+
+  # git-linked pipelines (audit-trail restore only — a sidecar written by
+  # restore-from-audit.sh when a deleted pipeline's MOVE_TO_GIT history was
+  # found, instead of a normal .yaml file). CONFIRMED via a real HAR capture
+  # of Harness's own "Import From Git" UI action — this is a genuinely
+  # separate endpoint from pipeline creation, not a variant of it (three
+  # earlier attempts at storeType=REMOTE on the v2 create endpoint all
+  # failed for exactly that reason — see git history/README for the trail).
+  # POST /pipeline/api/pipelines/import, body is just {"pipelineDescription":
+  # ""} — no YAML, no identifier, no stages. Harness reads the pipeline
+  # straight from the file at that path; nothing from the sidecar's "yaml"
+  # field (last-known content, kept for reference/debugging) is needed here.
+  for f in "$IN/$SCDIR"/pipelines/*.remote.json; do [[ -e "$f" ]] || continue
+    case "$SC" in
+      */*) qs="$(scope_qs "$SC")" ;;
+      *) echo "    SKIP git-linked pipeline (account-scope pipelines unsupported)"; SKIP=$((SKIP+1)); continue ;;
+    esac
+    pid="$(basename "$f" .remote.json)"
+    connectorRef="$(jq -r '.connectorRef' "$f")"; repoName="$(jq -r '.repoName' "$f")"
+    filePath="$(jq -r '.filePath' "$f")"; branch="$(jq -r '.branch // ""' "$f")"
+    importqs="connectorRef=$connectorRef&isHarnessCodeRepo=false&repoName=$repoName&branch=$branch&filePath=$filePath"
+    req POST "$BASE/pipeline/api/pipelines/import?$qs&$importqs&routingId=$ACC" json '{"pipelineDescription":""}' "pipeline/$pid (git-import)"
+    if [[ $? -eq 9 ]]; then
+      echo "    SKIP pipeline/$pid (git-import) (already exists in target — this script doesn't re-import an already-imported git-linked pipeline; delete it in target first if you need to re-run)"
+      SKIP=$((SKIP+1))
+    fi
   done
 
   # IACM workspaces (project scope only; after connectors/pipelines they reference)

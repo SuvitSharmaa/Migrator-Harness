@@ -184,22 +184,78 @@ get_checked() {
   printf '%s' "$body"
 }
 
+# get_single <path> -> body on stdout if HTTP 2xx and .data is non-null;
+# returns 1 (no diagnostic) on 404/empty so callers can print their own
+# domain-specific "not found" message instead of get_checked's generic one.
+get_single() {
+  local path="$1" tmp code body
+  tmp="$(mktemp)"
+  code="$(curl -s -o "$tmp" -w '%{http_code}' "${H[@]}" "$BASE/$path")"
+  body="$(cat "$tmp")"; rm -f "$tmp"
+  [[ "$code" =~ ^2 ]] || return 1
+  echo "$body" | jq -e '.data != null' >/dev/null 2>&1 || return 1
+  printf '%s' "$body"
+}
+
+# get_checked_paginated <path> <label> -> body on stdout, .data.content
+# merged across every page (same growth-detection stopping condition as
+# paginate_content). Validates the FIRST page's HTTP status/shape with
+# get_checked's clear diagnostics before looping further — an account with
+# more orgs/projects than fit in one page would otherwise have this script
+# report "project not found" even though the project clearly exists, just
+# not on page 0.
+get_checked_paginated() {
+  local path="$1" label="$2" page=0 acc='[]' resp got n merged old_count new_count
+  resp="$(get_checked "${path}&pageIndex=${page}&page=${page}" "$label")" || return 1
+  while :; do
+    got="$(echo "$resp" | jq -c '.data.content // []' 2>/dev/null)"
+    [[ -z "$got" || "$got" == "null" ]] && got='[]'
+    n="$(echo "$got" | jq 'length' 2>/dev/null)"; n="${n:-0}"
+    [[ "$n" -eq 0 ]] && break
+    old_count="$(echo "$acc" | jq 'length' 2>/dev/null)"; old_count="${old_count:-0}"
+    merged="$(jq -cn --argjson a "$acc" --argjson b "$got" '($a + $b) | unique' 2>/dev/null)"
+    [[ -z "$merged" ]] && merged="$acc"
+    new_count="$(echo "$merged" | jq 'length' 2>/dev/null)"; new_count="${new_count:-$old_count}"
+    [[ "$new_count" -eq "$old_count" ]] && break
+    acc="$merged"
+    page=$((page+1))
+    if [[ "$page" -gt 200 ]]; then
+      echo "  WARNING: get_checked_paginated stopped after 200 pages for $label — results may be incomplete" >&2
+      break
+    fi
+    resp="$(get "${path}&pageIndex=${page}&page=${page}")"
+  done
+  printf '{"data":{"content":%s}}' "$acc"
+}
+
 # --- discover scope tree -----------------------------------------------------
 mkdir -p "$OUT"
 echo "Discovering scope tree..."
-# get_checked runs in a $(...) subshell, so its internal `exit 1` only kills
-# that subshell — it does NOT stop this script on its own. The exit status of
-# a bare `VAR="$(cmd)"` assignment IS cmd's exit status, so `|| exit 1` here
-# is what actually propagates the failure up instead of silently continuing
-# with an empty ORGS_JSON/PROJ_JSON.
-ORGS_JSON="$(get_checked "ng/api/organizations?accountIdentifier=$ACC&routingId=$ACC&pageSize=200" "list organizations")" || exit 1
-PROJ_JSON="$(get_checked "ng/api/projects?accountIdentifier=$ACC&routingId=$ACC&pageSize=500" "list projects")" || exit 1
+# get_checked_paginated (account mode below) runs in a $(...) subshell, so
+# its internal `return 1` (from a failed first-page get_checked) only kills
+# that subshell — it does NOT stop this script on its own. The exit status
+# of a bare `VAR="$(cmd)"` assignment IS cmd's exit status, so `|| exit 1`
+# there is what actually propagates the failure up instead of silently
+# continuing with an empty ORGS_JSON/PROJ_JSON.
 if [[ "$PROJECT_MODE" -eq 1 ]]; then
-  echo "$ORGS_JSON" | jq --arg o "$SRC_ORG" \
-    '{orgs: [.data.content[].organization | select(.identifier==$o) | {identifier,name,description,tags}]}' > "$OUT/_orgs.json"
-  echo "$PROJ_JSON" | jq --arg o "$SRC_ORG" --arg p "$SRC_PROJECT" \
-    '{projects: [.data.content[].project | select(.orgIdentifier==$o and .identifier==$p) | {orgIdentifier,identifier,name,description,color,modules,tags}]}' > "$OUT/_projects.json"
+  # Single-project export: look up the org and project directly by
+  # identifier instead of paginating every org/project in the account.
+  # Accounts with many thousands of projects can have ties in the list
+  # endpoint's default sort (e.g. bulk-seeded rows sharing one
+  # lastModifiedAt timestamp) with no secondary sort key — offset-based
+  # pagination over such data can skip or repeat pages non-deterministically
+  # (get_checked_paginated's growth check then sees "no new items" and stops
+  # early), silently missing the one project being exported even though it
+  # unambiguously exists. A direct single-resource GET has no such issue.
+  ORG_BODY="$(get_single "ng/api/organizations/$SRC_ORG?accountIdentifier=$ACC&routingId=$ACC")" \
+    || { echo "org '$SRC_ORG' not found in source account $ACC" >&2; exit 1; }
+  PROJ_BODY="$(get_single "ng/api/projects/$SRC_PROJECT?accountIdentifier=$ACC&orgIdentifier=$SRC_ORG&routingId=$ACC")" \
+    || { echo "project '$SRC_ORG/$SRC_PROJECT' not found in source account $ACC" >&2; exit 1; }
+  echo "$ORG_BODY" | jq '{orgs: [.data.organization|{identifier,name,description,tags}]}' > "$OUT/_orgs.json"
+  echo "$PROJ_BODY" | jq '{projects: [.data.project|{orgIdentifier,identifier,name,description,color,modules,tags}]}' > "$OUT/_projects.json"
 else
+  ORGS_JSON="$(get_checked_paginated "ng/api/organizations?accountIdentifier=$ACC&routingId=$ACC&pageSize=200" "list organizations")" || exit 1
+  PROJ_JSON="$(get_checked_paginated "ng/api/projects?accountIdentifier=$ACC&routingId=$ACC&pageSize=500" "list projects")" || exit 1
   echo "$ORGS_JSON" | jq '{orgs: [.data.content[].organization|{identifier,name,description,tags}]}' > "$OUT/_orgs.json"
   echo "$PROJ_JSON" | jq '{projects: [.data.content[].project|{orgIdentifier,identifier,name,description,color,modules,tags}]}' > "$OUT/_projects.json"
 fi
@@ -451,5 +507,27 @@ if [[ "$PROJECT_MODE" -eq 1 ]]; then
 fi
 
 echo
+
+# In project mode, warn (don't touch anything) if OUT_DIR contains a
+# *different* project's leftover scope dir — export.sh only ever adds to
+# what's in OUT_DIR, never cleans it, so a shared/reused OUT_DIR across runs
+# leaves prior projects' data sitting there. import.sh will refuse to
+# proceed for exactly this reason ("expects exactly one project scope"), but
+# only after this whole export has already run — better to know now.
+if [[ "$PROJECT_MODE" -eq 1 ]]; then
+  MY_DIR="$(scope_dir "$SRC_ORG/$SRC_PROJECT")"
+  STALE=()
+  while IFS= read -r d; do
+    b="$(basename "$d")"
+    [[ "$b" == "$MY_DIR" ]] && continue
+    STALE+=("$b")
+  done < <(find "$OUT" -mindepth 1 -maxdepth 1 -type d -name '*__*' 2>/dev/null)
+  if [[ "${#STALE[@]}" -gt 0 ]]; then
+    echo "WARNING: '$OUT' also contains other project scope dir(s) from a previous run: ${STALE[*]}" >&2
+    echo "  import.sh will refuse to proceed with more than one present. Use a fresh OUT_DIR" >&2
+    echo "  per run (migrate.sh now defaults to one), or remove the stale dir(s) first." >&2
+  fi
+fi
+
 echo "Export complete -> $OUT"
 echo "Review $SECMAN before importing."
