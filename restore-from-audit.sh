@@ -16,13 +16,14 @@
 #
 # Two-phase flow: (1) discover what was deleted, write a CSV listing every
 # entity (Type, Identifier, StorageType, blank Restore, blank/pre-filled
-# Branch, Name), then BLOCK — waiting for you to open it, mark Restore
-# yes/no per row (and Branch for any remote pipeline/template you're
+# Branch, blank/pre-filled ConnectorRef, Name), then BLOCK — waiting for you
+# to open it, mark Restore yes/no per row (and Branch for any remote
+# pipeline/template, and ConnectorRef for any GitX webhook, you're
 # restoring), save, and press Enter. (2) re-read and validate that file,
-# looping back to the prompt if anything's wrong (missing branch on a
-# remote+yes row, garbage in Restore), then restore only what was approved.
-# The PROJECT itself always restores — it's not a peer choice, everything
-# else needs it to exist first.
+# looping back to the prompt if anything's wrong (missing branch/connectorRef
+# on a yes row that needs one, garbage in Restore), then restore only what
+# was approved. The PROJECT itself always restores — it's not a peer choice,
+# everything else needs it to exist first.
 #
 # Special case — Git-backed (REMOTE) pipelines/templates: a DELETE event's
 # oldYaml shows resolved *content*, not the storeType/connectorRef/repo/
@@ -34,6 +35,20 @@
 # review file's Branch column. If found, the pipeline/template is restored
 # as a git pointer (see import.sh's *.remote.json handling) instead of
 # inline content — the actual file is assumed to still exist in the repo.
+#
+# Special case — GitX webhooks (resource.type GITX_WEBHOOK): these exist
+# either as a SYSTEM-created side effect of a pipeline/template's Git link,
+# or as a webhook a user creates directly (Project Settings -> Webhooks;
+# confirmed via a real HAR capture of POST /v1/orgs/{org}/projects/{project}/
+# webhooks, body {webhook_identifier, webhook_name, spec:{webhook_type,
+# connector_ref, repo_name, folder_paths}}). Both kinds produce the exact
+# same audit YAML shape (name/identifier/repoName/isEnabled/repoURL/
+# webhookType/createdAt/lastUpdatedAt — confirmed against two separate real
+# deletions), and critically that YAML NEVER includes connectorRef, even
+# though the create API requires one. There is no way to recover it from
+# the audit trail, so the review file's ConnectorRef column is REQUIRED for
+# every GITX_WEBHOOK row marked Restore=yes — pick whichever connector in
+# the target points at the same repo the row's Name/repoName references.
 #
 # NOT restored (by design, matching migrate.sh project-mode's existing
 # scope): role assignments / user & group access, and anything whose
@@ -83,7 +98,7 @@ DELETE_START_MS=$(( NOW_MS - LOOKBACK_DAYS*86400*1000 ))
 GIT_START_MS=$(( NOW_MS - GIT_LOOKBACK_DAYS*86400*1000 ))
 
 D="$OUT/${SRC_ORG}__${SRC_PROJECT}"
-mkdir -p "$OUT" "$D"/{connectors,services,environments,pipelines,templates,filestore,serviceaccounts,usergroups,iacm-workspaces}
+mkdir -p "$OUT" "$D"/{connectors,services,environments,pipelines,templates,filestore,serviceaccounts,usergroups,iacm-workspaces,triggers,webhooks}
 SECMAN="$OUT/secrets-manifest.md"
 {
   echo "# Secrets manifest"
@@ -224,21 +239,36 @@ if [[ "$n_pt" -gt 0 ]]; then
   done < <(echo "$PIPE_TPL_IDS" | jq -r '.[]')
 fi
 
+# repoName -> connectorRef map, built from GIT_LINKS' MOVE_TO_GIT records —
+# used only as a best-effort ConnectorRef prefill suggestion for GITX_WEBHOOK
+# rows below (their audit YAML never carries connectorRef; see the header
+# comment). If no pipeline/template in this project was ever git-linked to
+# the webhook's repo, this stays empty and the row needs a manual value.
+REPO_CONNECTORS='{}'
+while IFS= read -r gy; do
+  [[ -z "$gy" ]] && continue
+  grepo="$(echo "$gy" | yq -r '.repo // ""' 2>/dev/null)"
+  gcr="$(echo "$gy" | yq -r '.connectorRef // ""' 2>/dev/null)"
+  [[ -z "$grepo" || -z "$gcr" ]] && continue
+  REPO_CONNECTORS="$(jq -cn --argjson m "$REPO_CONNECTORS" --arg r "$grepo" --arg c "$gcr" '$m + {($r): $c}')"
+done < <(echo "$GIT_LINKS" | jq -r '.[]')
+
 # ---- build a CSV review file and wait for approval before restoring -------
 # Every non-PROJECT entity gets a row (PROJECT is always restored — it's the
 # container everything else needs, not a peer choice). Restore is left
 # blank on purpose: blank/no means "don't restore this", so nothing comes
 # back by accident from an unfilled row. Branch is pre-filled with whatever
-# was captured from MOVE_TO_GIT (or GIT_RESTORE_BRANCH, if that's unset) as
-# a suggestion only — you can override it per row.
+# was captured from MOVE_TO_GIT (or GIT_RESTORE_BRANCH, if that's unset);
+# ConnectorRef (GITX_WEBHOOK rows only) is pre-filled from REPO_CONNECTORS
+# when a match is found. Both are suggestions only — you can override them.
 #
 # Column order matters: Name (freeform, can contain commas — e.g. "Hello,
 # World") is LAST on purpose. Type/Identifier/StorageType are system-
-# generated and comma-free by construction; Restore/Branch are user-typed
-# but constrained to simple tokens (yes/no, a git ref). Reading the file
-# back only ever parses the first 5 fields by position and discards
-# whatever's in position 6+ entirely — so a comma inside Name can never
-# corrupt the fields that actually drive restore logic.
+# generated and comma-free by construction; Restore/Branch/ConnectorRef are
+# user-typed but constrained to simple tokens (yes/no, a git ref, an
+# identifier). Reading the file back only ever parses the first 6 fields by
+# position and discards whatever's in position 7+ entirely — so a comma
+# inside Name can never corrupt the fields that actually drive restore logic.
 csv_escape() {
   local f="$1"
   if [[ "$f" == *,* || "$f" == *'"'* ]]; then
@@ -252,15 +282,17 @@ csv_escape() {
 REVIEW_CSV="$OUT/restore-review.csv"
 echo "Building review file..."
 {
-  echo "Type,Identifier,StorageType,Restore,Branch,Name"
+  echo "Type,Identifier,StorageType,Restore,Branch,ConnectorRef,Name"
   while IFS= read -r ev; do
     [[ -z "$ev" ]] && continue
     rtype="$(echo "$ev" | jq -r '.resource.type')"
     [[ "$rtype" == "PROJECT" ]] && continue
     rid="$(echo "$ev" | jq -r '.resource.identifier')"
+    aid="$(echo "$ev" | jq -r '.auditId')"
     rname="$(echo "$ev" | jq -r '.resource.labels.resourceName // .resource.identifier')"
     storeType="-"
     prefill_branch=""
+    prefill_connref=""
     if [[ "$rtype" == "PIPELINE" || "$rtype" == "TEMPLATE" ]]; then
       is_git="$(echo "$GIT_LINKS" | jq -r --arg id "$rid" 'has($id)')"
       if [[ "$is_git" == "true" ]]; then
@@ -271,10 +303,17 @@ echo "Building review file..."
       else
         storeType="inline"
       fi
+    elif [[ "$rtype" == "GITX_WEBHOOK" ]]; then
+      storeType="webhook"
+      wyaml="$(audit_yaml "$aid")"
+      if [[ -n "$wyaml" ]]; then
+        wrepo="$(echo "$wyaml" | yq -r '.gitXWebhook.repoName // ""' 2>/dev/null)"
+        [[ -n "$wrepo" ]] && prefill_connref="$(echo "$REPO_CONNECTORS" | jq -r --arg r "$wrepo" '.[$r] // ""')"
+      fi
     fi
-    printf '%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s\n' \
       "$(csv_escape "$rtype")" "$(csv_escape "$rid")" "$(csv_escape "$storeType")" \
-      "" "$(csv_escape "$prefill_branch")" "$(csv_escape "$rname")"
+      "" "$(csv_escape "$prefill_branch")" "$(csv_escape "$prefill_connref")" "$(csv_escape "$rname")"
   done < <(echo "$DELETES" | jq -c '.[]')
 } > "$REVIEW_CSV"
 
@@ -285,6 +324,11 @@ echo "Open it in Excel/Numbers/Google Sheets (keep it saved as CSV — same file
 echo "  - Restore: type yes or no (blank = no, nothing restores by accident)"
 echo "  - Branch: REQUIRED if StorageType=remote and Restore=yes. Some rows may already have a"
 echo "    suggested branch filled in from the audit trail — double check it's actually right."
+echo "  - ConnectorRef: REQUIRED if StorageType=webhook and Restore=yes — the audit trail never"
+echo "    records which connector a GitX webhook used, so pick whichever connector in the target"
+echo "    points at that webhook's repo (Name/repoName tells you which repo). Some rows may"
+echo "    already have a suggested connector filled in (only when a pipeline/template in this"
+echo "    project was git-linked to the same repo) — double check it's actually right."
 echo "Leave Type/Identifier/StorageType/Name alone; they're not read back."
 echo
 
@@ -311,14 +355,17 @@ trim() {
 APPROVED_TYPES=()
 APPROVED_IDS=()
 APPROVED_BRANCHES=()
+APPROVED_CONNREFS=()
 
-# is_approved TYPE ID -> 0 and sets $APPROVED_BRANCH_FOR if approved, else 1.
-# Linear search over a handful-to-low-hundreds of rows — fine at this scale.
+# is_approved TYPE ID -> 0 and sets $APPROVED_BRANCH_FOR/$APPROVED_CONNREF_FOR
+# if approved, else 1. Linear search over a handful-to-low-hundreds of rows —
+# fine at this scale.
 is_approved() {
   local t="$1" i="$2" idx=0 n=${#APPROVED_TYPES[@]}
   while [[ "$idx" -lt "$n" ]]; do
     if [[ "${APPROVED_TYPES[$idx]}" == "$t" && "${APPROVED_IDS[$idx]}" == "$i" ]]; then
       APPROVED_BRANCH_FOR="${APPROVED_BRANCHES[$idx]}"
+      APPROVED_CONNREF_FOR="${APPROVED_CONNREFS[$idx]}"
       return 0
     fi
     idx=$((idx+1))
@@ -338,7 +385,7 @@ while :; do
   fi
 
   PROBLEMS=()
-  APPROVED_TYPES=(); APPROVED_IDS=(); APPROVED_BRANCHES=()
+  APPROVED_TYPES=(); APPROVED_IDS=(); APPROVED_BRANCHES=(); APPROVED_CONNREFS=()
   row_num=0
   # `read` returns non-zero on a final line with no trailing newline, and
   # `while CMD; do BODY; done` only runs BODY when CMD succeeds — so a plain
@@ -349,20 +396,23 @@ while :; do
   # guarantees the true last row always gets its own terminated line; the
   # phantom empty line this adds hits the blank-line skip below and is a
   # no-op.
-  while IFS=, read -r c1 c2 c3 c4 c5 _rest; do
+  while IFS=, read -r c1 c2 c3 c4 c5 c6 _rest; do
     row_num=$((row_num+1))
     [[ "$row_num" -eq 1 ]] && continue
     [[ -z "$c1" && -z "$c2" ]] && continue
     rtype="$(csv_unquote "$c1")"; rid="$(csv_unquote "$c2")"; stype="$(csv_unquote "$c3")"
     restore_val="$(trim "$(csv_unquote "$c4")")"; branch_val="$(trim "$(csv_unquote "$c5")")"
+    connref_val="$(trim "$(csv_unquote "$c6")")"
     restore_norm="$(printf '%s' "$restore_val" | tr '[:upper:]' '[:lower:]')"
     case "$restore_norm" in
       ""|no|n) : ;;
       yes|y)
         if [[ "$stype" == "remote" && -z "$branch_val" ]]; then
           PROBLEMS+=("row $row_num ($rtype/$rid): marked yes but StorageType=remote and Branch is empty")
+        elif [[ "$stype" == "webhook" && -z "$connref_val" ]]; then
+          PROBLEMS+=("row $row_num ($rtype/$rid): marked yes but StorageType=webhook and ConnectorRef is empty")
         else
-          APPROVED_TYPES+=("$rtype"); APPROVED_IDS+=("$rid"); APPROVED_BRANCHES+=("$branch_val")
+          APPROVED_TYPES+=("$rtype"); APPROVED_IDS+=("$rid"); APPROVED_BRANCHES+=("$branch_val"); APPROVED_CONNREFS+=("$connref_val")
         fi
         ;;
       *)
@@ -488,6 +538,28 @@ while IFS= read -r ev; do
       [[ -z "$yaml" ]] && { echo "    SKIP SERVICE_ACCOUNT/$rid (no YAML in audit record)" >&2; continue; }
       echo "$yaml" | yq -o=json '.' > "$D/serviceaccounts/$rid.json" 2>/dev/null
       echo "    SERVICE_ACCOUNT/$rid -> restored (best-effort — verify shape)"
+      ;;
+    TRIGGER)
+      yaml="$(audit_yaml "$aid")"
+      [[ -z "$yaml" ]] && { echo "    SKIP TRIGGER/$rid (no YAML in audit record)" >&2; continue; }
+      printf '%s' "$yaml" > "$D/triggers/$rid.yaml"
+      echo "    TRIGGER/$rid -> restored"
+      ;;
+    GITX_WEBHOOK)
+      yaml="$(audit_yaml "$aid")"
+      [[ -z "$yaml" ]] && { echo "    SKIP GITX_WEBHOOK/$rid (no YAML in audit record)" >&2; continue; }
+      wname="$(echo "$yaml" | yq -r '.gitXWebhook.name // "'"$rid"'"')"
+      wrepo="$(echo "$yaml" | yq -r '.gitXWebhook.repoName // ""')"
+      # ConnectorRef comes from the reviewed/validated CSV, not from the
+      # audit YAML — it's never present there (see header comment). is_approved
+      # already confirmed this exact row is "yes" and (since StorageType=
+      # webhook) guaranteed a non-empty ConnectorRef during validation.
+      is_approved "$rtype" "$rid" >/dev/null
+      connectorRef="$APPROVED_CONNREF_FOR"
+      jq -n --arg id "$rid" --arg name "$wname" --arg cr "$connectorRef" --arg repo "$wrepo" \
+        '{webhook_identifier:$id, webhook_name:$name, spec:{webhook_type:"GIT", connector_ref:$cr, repo_name:$repo, folder_paths:[""]}}' \
+        > "$D/webhooks/$rid.json"
+      echo "    GITX_WEBHOOK/$rid -> restored (connectorRef: $connectorRef)"
       ;;
     *)
       UNSUPPORTED+=("$rtype/$rid")

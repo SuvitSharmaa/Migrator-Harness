@@ -13,8 +13,8 @@
 #
 # Dependency order: orgs(exist) -> projects -> templates -> connectors ->
 # service accounts -> user groups -> services -> environments ->
-# infrastructures -> pipelines. Every entity is UPSERTed (create; on
-# "already exists" fall back to update).
+# infrastructures -> pipelines -> triggers. Every entity is UPSERTed
+# (create; on "already exists" fall back to update).
 #
 # NOT imported (by design):
 #   - secrets       : values can't be exported; see harness-export/secrets-manifest.md
@@ -24,6 +24,18 @@
 #     and resources outside these entity types (e.g. Monitored Services) —
 #     out of scope; a handful of IACM workspaces/pipelines may still need
 #     manual follow-up if they depend on these.
+#   Note on GitX webhooks: a webhook that appears ONLY as a side effect of a
+#   pipeline/template's Git link (no independent create call — confirmed via
+#   a HAR capture) reappears on its own once that entity's git-import
+#   succeeds against the target's connector; re-importing it here is
+#   harmless (falls back to update) but not required. A manually-created
+#   GitX webhook (Project Settings -> Webhooks) IS a real, independently-
+#   creatable resource and IS imported (see the webhooks/ loop below). A
+#   LIVE export.sh run reads spec.connector_ref straight from the API, so
+#   this ambiguity never matters for normal project/account migration —
+#   it's restore-from-audit.sh specifically that can't tell the two kinds
+#   apart from the audit trail alone (no connectorRef in a delete event's
+#   YAML), so that path asks you to supply ConnectorRef by hand instead.
 #
 # Usage:
 #   HARNESS_TOKEN=<target-token> TGT_ACCOUNT_ID=<acct> ./import.sh            # apply
@@ -452,6 +464,63 @@ for SCDIR in "${SCDIRS[@]}"; do
       echo "    SKIP pipeline/$pid (git-import) (already exists in target — this script doesn't re-import an already-imported git-linked pipeline; delete it in target first if you need to re-run)"
       SKIP=$((SKIP+1))
     fi
+  done
+
+  # triggers (YAML, root key "trigger") — CONFIRMED via a real HAR capture of
+  # Harness's own "New Trigger" UI action: POST /pipeline/api/triggers with
+  # accountIdentifier/orgIdentifier/projectIdentifier/targetIdentifier query
+  # params (targetIdentifier = the trigger's pipeline) and the raw trigger
+  # YAML as an application/yaml body. If the target pipeline is itself
+  # git-linked (has a sidecar .remote.json — see the pipeline git-import
+  # block above), the same capture showed the create call also carrying
+  # branch/connectorRef/repoName/storeType=REMOTE query params, so mirror
+  # that when present. No confirmed capture of the trigger UPDATE call
+  # exists yet — the PUT /pipeline/api/triggers/{id} path below follows this
+  # codebase's usual create-then-update convention, not an independent
+  # verification; if it 400s, capture that call before trusting it further.
+  for f in "$IN/$SCDIR"/triggers/*.yaml; do [[ -e "$f" ]] || continue
+    case "$SC" in
+      */*) torg="${SC%%/*}"; tproj="${SC#*/}"; qs="$(scope_qs "$SC")" ;;
+      *) echo "    SKIP trigger (account-scope triggers unsupported)"; SKIP=$((SKIP+1)); continue ;;
+    esac
+    tid="$(basename "$f" .yaml)"
+    pid="$(yaml_get "$f" ".trigger.pipelineIdentifier")"
+    if [[ -z "$pid" || "$pid" == "null" ]]; then
+      echo "    SKIP trigger/$tid (couldn't determine target pipelineIdentifier)"; SKIP=$((SKIP+1)); continue
+    fi
+    body="$(rewrite_scope_yaml "$f" "trigger" "$torg" "$tproj")"
+    gitqs=""
+    remf="$IN/$SCDIR/pipelines/$pid.remote.json"
+    if [[ -e "$remf" ]]; then
+      gconnectorRef="$(jq -r '.connectorRef' "$remf")"; grepoName="$(jq -r '.repoName' "$remf")"
+      gbranch="$(jq -r '.branch // ""' "$remf")"
+      gitqs="&branch=$gbranch&connectorRef=$gconnectorRef&repoName=$grepoName&storeType=REMOTE"
+    fi
+    req POST "$BASE/pipeline/api/triggers?$qs&targetIdentifier=$pid&ignoreError=false$gitqs&routingId=$ACC" yaml "$body" "trigger/$tid"
+    [[ $? -eq 9 ]] && req PUT "$BASE/pipeline/api/triggers/$tid?$qs&targetIdentifier=$pid&ignoreError=false$gitqs&routingId=$ACC" yaml "$body" "trigger/$tid (update)"
+  done
+
+  # GitX webhooks (JSON, no wrap) — CONFIRMED via a real HAR capture of
+  # Harness's own "New Webhook" UI action (Project Settings -> Webhooks):
+  # POST /v1/orgs/{org}/projects/{project}/webhooks, body {webhook_identifier,
+  # webhook_name, spec:{webhook_type, connector_ref, repo_name,
+  # folder_paths}}. This is a genuinely different, listable REST API (GET-
+  # style /v1/... paths) from the pipeline/template git-import endpoints
+  # above — not the same "system side effect" webhook that gets silently
+  # recreated when a pipeline reconnects to git; a manually-created one only
+  # comes back if explicitly restored here. The UPDATE call (PUT to this
+  # same base path + /{id}) was NOT captured — this follows the codebase's
+  # usual create-then-update convention, unverified; if it 400s, capture
+  # that call before trusting it further.
+  for f in "$IN/$SCDIR"/webhooks/*.json; do [[ -e "$f" ]] || continue
+    wid="$(basename "$f" .json)"
+    case "$SC" in
+      */*) worg="${SC%%/*}"; wproj="${SC#*/}" ;;
+      *) echo "    SKIP webhook/$wid (account-scope webhooks unsupported)"; SKIP=$((SKIP+1)); continue ;;
+    esac
+    wbase="$BASE/v1/orgs/$worg/projects/$wproj/webhooks"
+    req POST "$wbase?routingId=$ACC" json "$(cat "$f")" "webhook/$wid"
+    [[ $? -eq 9 ]] && req PUT "$wbase/$wid?routingId=$ACC" json "$(cat "$f")" "webhook/$wid (update)"
   done
 
   # IACM workspaces (project scope only; after connectors/pipelines they reference)

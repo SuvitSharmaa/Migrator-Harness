@@ -15,6 +15,8 @@
 #   <scope>/environments/<env>.infra/*.yaml   infrastructure YAML per env
 #   <scope>/pipelines/*.yaml           pipeline YAML
 #   <scope>/templates/<id>__<ver>.yaml template YAML, one file per version
+#   <scope>/triggers/*.yaml            trigger YAML, one file per trigger (project scope only)
+#   <scope>/webhooks/*.json            GitX webhook config (project scope only)
 #   <scope>/filestore/...              file-store files + folder manifest
 # where <scope> is "account", "org-scope__<org>" (org-only — see project mode
 # below), or "<org>__<project>".
@@ -296,7 +298,7 @@ for SC in "${SCOPES[@]}"; do
   QS="$(scope_qs "$SC")"
   D="$OUT/$(scope_dir "$SC")"
   echo "=========== exporting scope: $SC -> $D ==========="
-  mkdir -p "$D"/{connectors,services,environments,pipelines,templates,filestore,serviceaccounts,usergroups,iacm-workspaces}
+  mkdir -p "$D"/{connectors,services,environments,pipelines,templates,triggers,webhooks,filestore,serviceaccounts,usergroups,iacm-workspaces}
 
   # connectors (full spec returned inline by listV2)
   CONN="$(paginate_content POST "ng/api/connectors/listV2?$QS&routingId=$ACC&pageSize=1000" '{"filterType":"Connector"}')"
@@ -352,6 +354,68 @@ for SC in "${SCOPES[@]}"; do
     [[ -z "$pid" ]] && continue
     get "pipeline/api/pipelines/$pid?$QS&routingId=$ACC" | jq -r '.data.yamlPipeline' > "$D/pipelines/$pid.yaml"
   done
+
+  # triggers (one per pipeline; GET .../pipeline/api/triggers?...&targetIdentifier=<pipelineId>
+  # returns each trigger's own `yaml` field directly — CONFIRMED via a real
+  # HAR capture of the "New Trigger" UI list-refresh call, same endpoint
+  # import.sh's create call uses). Account-scope has no pipelines/triggers,
+  # so this only ever runs anything for project scope.
+  tn_total=0
+  case "$SC" in
+    */*)
+      echo "$PIP" | jq -r '.data.content[].identifier' | while read -r pid; do
+        [[ -z "$pid" ]] && continue
+        TRG="$(paginate_content GET "pipeline/api/triggers?$QS&targetIdentifier=$pid&size=1000&routingId=$ACC")"
+        echo "$TRG" | jq -c '.data.content[]?' | while read -r t; do
+          tid="$(echo "$t" | jq -r '.identifier')"
+          [[ -z "$tid" || "$tid" == "null" ]] && continue
+          echo "$t" | jq -r '.yaml' > "$D/triggers/$tid.yaml"
+        done
+      done
+      ;;
+  esac
+  tn_total="$(find "$D/triggers" -name '*.yaml' 2>/dev/null | wc -l | tr -d ' ')"
+  echo "  triggers:   ${tn_total:-0}"
+
+  # GitX webhooks — CONFIRMED via a real HAR capture of Harness's "New
+  # Webhook" UI (Project Settings -> Webhooks): POST /v1/orgs/{org}/
+  # projects/{project}/webhooks/list?limit=&page=, no body, response is a
+  # bare JSON array (not wrapped in .data.content like the NG APIs above),
+  # each entry already carrying spec.connector_ref — unlike audit-trail
+  # restore, a LIVE export can see this directly, no manual entry needed.
+  # Path-scoped (org/project baked into the URL), so account scope has none.
+  wn=0
+  case "$SC" in
+    */*)
+      worg="${SC%%/*}"; wproj="${SC#*/}"
+      wbase="v1/orgs/$worg/projects/$wproj/webhooks/list"
+      wpage=0 wacc='[]'
+      while :; do
+        wresp="$(post "${wbase}?limit=1000&page=${wpage}" '')"
+        wgot="$(echo "$wresp" | jq -c 'if type=="array" then . else [] end' 2>/dev/null)"
+        [[ -z "$wgot" || "$wgot" == "null" ]] && wgot='[]'
+        wn_page="$(echo "$wgot" | jq 'length' 2>/dev/null)"; wn_page="${wn_page:-0}"
+        [[ "$wn_page" -eq 0 ]] && break
+        wold="$(echo "$wacc" | jq 'length' 2>/dev/null)"; wold="${wold:-0}"
+        wmerged="$(jq -cn --argjson a "$wacc" --argjson b "$wgot" '($a + $b) | unique_by(.webhook_identifier)' 2>/dev/null)"
+        [[ -z "$wmerged" ]] && wmerged="$wacc"
+        wnew="$(echo "$wmerged" | jq 'length' 2>/dev/null)"; wnew="${wnew:-$wold}"
+        [[ "$wnew" -eq "$wold" ]] && break
+        wacc="$wmerged"; wpage=$((wpage+1))
+        [[ "$wpage" -gt 200 ]] && { echo "  WARNING: webhook pagination stopped after 200 pages for $SC — results may be incomplete" >&2; break; }
+      done
+      wn="$(echo "$wacc" | jq 'length' 2>/dev/null)"; wn="${wn:-0}"
+      if [[ "${wn:-0}" -gt 0 ]]; then
+        echo "$wacc" | jq -c '.[]' | while read -r w; do
+          wid="$(echo "$w" | jq -r '.webhook_identifier')"
+          [[ -z "$wid" || "$wid" == "null" ]] && continue
+          echo "$w" | jq '{webhook_identifier, webhook_name, spec: (.spec | {webhook_type, connector_ref, repo_name, folder_paths: (.folder_paths // [])})}' \
+            > "$D/webhooks/$wid.json"
+        done
+      fi
+      ;;
+  esac
+  echo "  webhooks:   ${wn:-0}"
 
   # templates (versioned)
   TPL="$(paginate_content POST "template/api/templates/list?$QS&routingId=$ACC&templateListType=All&pageSize=1000" '{"filterType":"Template"}')"
