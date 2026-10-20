@@ -7,4 +7,8 @@ customer-exports/
 # migrate.sh/export.sh default output dir — real org/connector/pipeline config
 # pulled from a customer account. Never commit it.
 harness-export/
+
+# input-sets-from-audit.sh default output dir — recovered input set YAML,
+# same customer-data reasoning as harness-export/.
+input-set-recovery/
 .DS_Store

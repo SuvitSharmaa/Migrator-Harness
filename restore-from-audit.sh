@@ -129,7 +129,8 @@ paginate_audits() {
     if [[ "$page" -eq 0 && ! "$code" =~ ^2 ]]; then
       echo "ERROR: $label failed (HTTP $code) against $BASE" >&2
       echo "  Check SRC_BASE_URL/HARNESS_TOKEN, and that this token has audit-trail read access." >&2
-      echo "  Response: $(echo "$resp" | head -c 300)" >&2
+      # Untruncated on purpose — see export.sh's paginate_content for why.
+      echo "  Response: $resp" >&2
       return 1
     fi
     got="$(echo "$resp" | jq -c '.data.content // []' 2>/dev/null)"
