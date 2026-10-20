@@ -200,6 +200,33 @@ and skips already-created secrets, so it's safe to run repeatedly.
 `import.sh` discovers which scope directories the export actually produced
 rather than assuming fixed org/project names, so this works for any account.
 
+### Fixing failures without re-running everything
+
+`import.sh` doesn't exit when entities fail. After each pass it writes
+`summary-run<N>.csv` into the export directory — every entity, its status, and
+the **full** error — then waits for you:
+
+| Input | What happens |
+| --- | --- |
+| `Enter` | Re-reads the CSV, applies your corrected `Branch` / `GitFilePath` / `ConnectorRef` to the underlying files, and retries **only** the rows still marked `failed` |
+| `FORCE` | Writes `force-inline-review.csv`; mark `ConvertToInline=Yes` per row to rebuild unreachable git-linked pipelines/templates as **inline** entities from the content captured at delete time |
+| `terminate` | Stops. The latest CSV is your record |
+
+The common case this exists for: a restored git-backed pipeline whose audit
+trail recorded `branch=master`, but the YAML actually lives on a different
+branch (or was deleted from the repo). Check the repo yourself, correct the
+`Branch` cell, press Enter. Rows marked `NOT RETRYABLE` — e.g. a pipeline whose
+org-level template is missing — can't be fixed by editing those fields, so they
+are kept in every round's CSV for the record but never re-attempted.
+
+`FORCE` is a real change: a converted entity **stops being git-backed**. It's
+opt-in per row, and `force-inline-review.csv` is the paper trail for re-linking
+them to Git later. Rows whose recovered content is empty, or which reference a
+template that failed this run, are refused — converting them would only fail
+again the same way.
+
+Full untruncated API responses for every failure land in `import-errors.log`.
+
 ## ⚠️ Secret values are NOT migrated
 
 The Harness API never returns secret material (`value: null` on export). `secrets.sh`

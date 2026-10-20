@@ -123,7 +123,13 @@ tally() {
   if [[ "$code" =~ ^2 ]]; then printf '    OK   %s (%s)\n' "$label" "$code"; PASS=$((PASS+1)); return; fi
   if echo "$resp" | grep -qiE 'already exists|DUPLICATE'; then
     printf '    SKIP %s (already exists)\n' "$label"; SKIP=$((SKIP+1)); return; fi
-  printf '    FAIL %s (%s) %s\n' "$label" "$code" "$(echo "$resp" | jq -r '.message // empty' 2>/dev/null | head -c 140)" >&2
+  # Full error, never truncated — a cut-off message routinely reads as a
+  # different (and simpler) problem than the real one. Falls back to the raw
+  # body when there is no .message at all, and flattens newlines so a single
+  # failure stays a single console line.
+  local msg; msg="$(echo "$resp" | jq -r '.message // empty' 2>/dev/null)"
+  [[ -z "$msg" ]] && msg="$resp"
+  printf '    FAIL %s (%s) %s\n' "$label" "$code" "$(printf '%s' "$msg" | tr '\n\r\t' '   ')" >&2
   FAIL=$((FAIL+1)); FAILED+=("$label ($code)")
 }
 

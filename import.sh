@@ -37,6 +37,35 @@
 #   apart from the audit trail alone (no connectorRef in a delete event's
 #   YAML), so that path asks you to supply ConnectorRef by hand instead.
 #
+# Failure handling — the retry loop:
+#   This script does NOT exit on failures. After each pass it writes
+#   <IN_DIR>/summary-run<N>.csv listing every entity with its status and the
+#   FULL error, then waits:
+#
+#     [Enter]     re-read the CSV, write the operator's corrected Branch /
+#                 GitFilePath / ConnectorRef back into the files the import
+#                 actually reads, and re-attempt ONLY the rows still marked
+#                 `failed`. Writes summary-run<N+1>.csv and asks again.
+#     [FORCE]     emit force-inline-review.csv listing the still-failing
+#                 git-linked pipelines/templates; the operator marks
+#                 ConvertToInline=Yes per row, and those are rebuilt as inline
+#                 entities from the content captured at delete time. They stop
+#                 being git-backed — hence opt-in, per row, on paper.
+#     [terminate] stop; the latest CSV is the record.
+#
+#   Why the write-back exists: a git-linked pipeline is represented on disk by
+#   <id>.remote.json holding {connectorRef, repoName, filePath, branch, yaml}.
+#   The import reads the branch from THAT file, never from the review CSV — so
+#   before this loop existed, correcting a branch in the CSV had no effect on
+#   anything. Rows marked NOT RETRYABLE (e.g. a pipeline whose org-level
+#   template is missing) can't be fixed by editing any of those fields; they
+#   are kept in every round's CSV for the record but never re-attempted.
+#
+#   Full, untruncated API response bodies for every non-2xx go to
+#   <IN_DIR>/import-errors.log. The console line is a flattened one-liner;
+#   some Harness errors ("Error occurred while creating webhook") carry nothing
+#   useful in .message at all and only the raw body explains them.
+#
 # Usage:
 #   HARNESS_TOKEN=<target-token> TGT_ACCOUNT_ID=<acct> ./import.sh            # apply
 #   HARNESS_TOKEN=<target-token> TGT_ACCOUNT_ID=<acct> DRY_RUN=1 ./import.sh  # preview
@@ -87,6 +116,90 @@ is_builtin() { case " $BUILTIN_CONNECTORS " in *" $1 "*) return 0;; *) return 1;
 PASS=0; FAIL=0; SKIP=0
 declare -a FAILED
 
+# ---- run artifacts (retry loop) --------------------------------------------
+# RESULTS is a JSONL scratch file holding one record per entity attempted in
+# the CURRENT round. It exists because the per-entity outcome has to survive
+# subshells: the projects loop below is `jq ... | while read`, whose body runs
+# in a subshell, so `PASS=$((PASS+1))` inside it is silently discarded by the
+# parent (this is why a run that printed 100 OK lines reported "99 ok"). A
+# file sidesteps the whole class of problem, and doubles as the source the
+# summary CSV is built from.
+#
+# ERRLOG gets the FULL raw response body for every non-2xx — not the trimmed
+# one-line `.message` the console shows. Needed because some Harness errors
+# ("Error occurred while creating webhook") carry nothing useful in .message
+# at all, and the real cause only ever appears in the rest of the body.
+RESULTS="$(mktemp)"
+ERRLOG="$IN/import-errors.log"
+RUN_ROUND=1
+# Allowlist of "TYPE<TAB>ID" lines to re-attempt. EMPTY FILE IS NOT "ALLOW
+# NOTHING" — RETRY_ONLY is only consulted when RETRY_ACTIVE=1, so round 1
+# attempts everything. Keeping these as two separate flags (rather than
+# treating an empty allowlist as "first round") means a retry round that
+# legitimately resolves to zero entities can't silently turn into a full
+# re-import of all 344.
+RETRY_ONLY="$(mktemp)"
+RETRY_ACTIVE=0
+# Fully-formatted CSV rows for entities NOT attempted in the current round —
+# anything already succeeded, or classified NOT RETRYABLE. Re-emitted into
+# every subsequent summary so the file stays a complete record of the restore
+# rather than a shrinking view of only what's still being retried.
+CARRY_FORWARD="$(mktemp)"
+trap 'rm -f "$RESULTS" "$RETRY_ONLY" "$CARRY_FORWARD"' EXIT
+
+# parse_label LABEL -> sets LBL_TYPE / LBL_ID / LBL_VARIANT
+#   Labels passed to req() are already structured as "<type>/<id>" with an
+#   optional " (variant)" suffix — e.g. "pipeline/foo (git-import)",
+#   "template/bar/v1 (update)", "infra/prod/eks". Splitting here rather than
+#   threading type/id through ~20 call sites keeps req()'s signature stable.
+#   IDs legitimately contain slashes (template/<id>/<ver>, infra/<env>/<id>),
+#   so only the FIRST slash is treated as the type separator.
+LBL_TYPE=""; LBL_ID=""; LBL_VARIANT=""
+parse_label() {
+  local l="$1" base=""
+  LBL_VARIANT=""
+  case "$l" in
+    *" ("*")") LBL_VARIANT="${l##*\(}"; LBL_VARIANT="${LBL_VARIANT%\)}"; base="${l%% (*}" ;;
+    *)         base="$l" ;;
+  esac
+  LBL_TYPE="${base%%/*}"
+  if [[ "$base" == */* ]]; then LBL_ID="${base#*/}"; else LBL_ID=""; fi
+}
+
+# record_result LABEL STATUS CODE ERROR
+#   STATUS is one of: ok | failed | skipped. Written as JSON so the error text
+#   (which routinely contains commas and quotes) can't corrupt the record —
+#   CSV escaping happens later, once, at write time.
+#
+#   Newlines are flattened HERE, at the single choke point every record passes
+#   through, rather than only in req(). A multi-line cell is technically valid
+#   CSV and a strict parser copes, but the read-back loop below is line-
+#   oriented: the continuation lines come back as phantom rows with an empty
+#   Status and get silently carried forward into the next round's file. Doing
+#   it here means no future caller can reintroduce that.
+record_result() {
+  parse_label "$1"
+  local err; err="$(printf '%s' "$4" | tr '\n\r\t' '   ')"
+  jq -cn --arg t "$LBL_TYPE" --arg i "$LBL_ID" --arg v "$LBL_VARIANT" \
+         --arg s "$2" --arg c "$3" --arg e "$err" --arg d "${SCDIR:-}" \
+    '{type:$t, id:$i, variant:$v, status:$s, code:$c, error:$e, scdir:$d}' >> "$RESULTS"
+}
+
+# log_raw_error LABEL CODE BODY -> append the untruncated response to ERRLOG
+log_raw_error() {
+  { printf '=== round %s | %s | HTTP %s ===\n' "$RUN_ROUND" "$1" "$2"
+    printf '%s\n\n' "$3"
+  } >> "$ERRLOG"
+}
+
+# should_attempt TYPE ID -> 0 if this entity should be tried in this round.
+#   Round 1 (RETRY_ACTIVE=0) attempts everything. A retry round attempts only
+#   what the operator left marked as failed in the summary CSV.
+should_attempt() {
+  [[ "$RETRY_ACTIVE" -eq 0 ]] && return 0
+  grep -qxF "$1	$2" "$RETRY_ONLY"
+}
+
 scope_qs() {
   case "$1" in
     account) echo "accountIdentifier=$ACC" ;;
@@ -115,27 +228,47 @@ split_org_proj() {
 req() {
   local method="$1" url="$2" ctype="$3" body="$4" label="$5"
   if [[ "$DRY" == "1" ]]; then
-    printf '    [dry] %s %s\n' "$method" "$label"; SKIP=$((SKIP+1)); return 0
+    printf '    [dry] %s %s\n' "$method" "$label"; SKIP=$((SKIP+1))
+    record_result "$label" skipped "" "dry run"
+    return 0
   fi
   local hdr=(); [[ "$ctype" == yaml ]] && hdr=("${HY[@]}") || hdr=("${H[@]}")
   local tmp code; tmp="$(mktemp)"
   code="$(curl -s -o "$tmp" -w '%{http_code}' -X "$method" "$url" "${hdr[@]}" --data-binary "$body")"
   local resp; resp="$(cat "$tmp")"; rm -f "$tmp"
   if [[ "$code" =~ ^2 ]]; then
-    printf '    OK   %s (%s)\n' "$label" "$code"; PASS=$((PASS+1)); return 0
+    printf '    OK   %s (%s)\n' "$label" "$code"; PASS=$((PASS+1))
+    record_result "$label" ok "$code" ""
+    return 0
   fi
+  # Error text for the console/CSV: prefer the structured .message, but fall
+  # back to the raw body when there isn't one (some endpoints return a bare
+  # string or an unexpected shape). No length cap — the whole point is that a
+  # truncated error reads as a different, simpler problem than it actually is.
+  # Newlines are collapsed to spaces ONLY here; ERRLOG keeps them verbatim.
+  local msg
+  msg="$(echo "$resp" | jq -r '.message // .responseMessages[0].message // empty' 2>/dev/null)"
+  [[ -z "$msg" ]] && msg="$resp"
+  msg="$(printf '%s' "$msg" | tr '\n\r\t' '   ')"
+  log_raw_error "$label" "$code" "$resp"
   # Already-exists -> let caller try update by returning special code 9.
   # Print the actual response even here — this used to be silent, which
   # meant a real failure that merely happened to contain a matching phrase
   # (or a genuine conflict for a reason other than "the record exists")
   # was invisible; you'd only ever see the SECOND call's (the update
   # attempt's) error, which can be misleading about the real cause.
+  #
+  # No record_result here on purpose: a 9 always means the caller is about to
+  # issue the update call, and THAT call records the entity's real outcome.
+  # Recording both would leave two rows per entity for the CSV to reconcile.
   if echo "$resp" | grep -qiE 'already exists|duplicate|DUPLICATE_FIELD'; then
-    printf '    (exists) %s (%s) %s -- trying update\n' "$label" "$code" "$(echo "$resp" | jq -r '.message // .responseMessages[0].message // empty' 2>/dev/null | head -c 160)"
+    printf '    (exists) %s (%s) %s -- trying update\n' "$label" "$code" "$msg"
     return 9
   fi
-  printf '    FAIL %s (%s) %s\n' "$label" "$code" "$(echo "$resp" | jq -r '.message // .responseMessages[0].message // empty' 2>/dev/null | head -c 160)" >&2
-  FAIL=$((FAIL+1)); FAILED+=("$label ($code)"); return 1
+  printf '    FAIL %s (%s) %s\n' "$label" "$code" "$msg" >&2
+  FAIL=$((FAIL+1)); FAILED+=("$label ($code)")
+  record_result "$label" failed "$code" "$msg"
+  return 1
 }
 
 # upsert_json BASEPATH SCOPE WRAPKEY FILE LABEL
@@ -260,20 +393,364 @@ upsert_iacm_workspace() {
     + {terraform_variables: (.terraform_variables // {}),
        environment_variables: (.environment_variables // {})}' "$file")"
 
-  if [[ "$DRY" == "1" ]]; then printf '    [dry] POST %s\n' "$label"; SKIP=$((SKIP+1)); return 0; fi
-  local tmp code resp; tmp="$(mktemp)"
+  if [[ "$DRY" == "1" ]]; then
+    printf '    [dry] POST %s\n' "$label"; SKIP=$((SKIP+1))
+    record_result "$label" skipped "" "dry run"; return 0
+  fi
+  local tmp code resp msg; tmp="$(mktemp)"
   code="$(curl -s -o "$tmp" -w '%{http_code}' -X POST "$base?routingId=$ACC" "${HI[@]}" --data-binary "$body")"
   resp="$(cat "$tmp")"; rm -f "$tmp"
-  if [[ "$code" =~ ^2 ]]; then printf '    OK   %s (%s)\n' "$label" "$code"; PASS=$((PASS+1)); return 0; fi
+  if [[ "$code" =~ ^2 ]]; then
+    printf '    OK   %s (%s)\n' "$label" "$code"; PASS=$((PASS+1))
+    record_result "$label" ok "$code" ""; return 0
+  fi
+  log_raw_error "$label" "$code" "$resp"
   if echo "$resp" | grep -qiE 'already exists|duplicate|exists'; then
-    printf '    (exists) %s (%s) %s -- trying update\n' "$label" "$code" "$(echo "$resp" | jq -r '.message // empty' 2>/dev/null | head -c 160)"
+    msg="$(echo "$resp" | jq -r '.message // empty' 2>/dev/null)"; [[ -z "$msg" ]] && msg="$resp"
+    printf '    (exists) %s (%s) %s -- trying update\n' "$label" "$code" "$(printf '%s' "$msg" | tr '\n\r\t' '   ')"
     tmp="$(mktemp)"
     code="$(curl -s -o "$tmp" -w '%{http_code}' -X PUT "$base/$id?routingId=$ACC" "${HI[@]}" --data-binary "$body")"
     resp="$(cat "$tmp")"; rm -f "$tmp"
-    if [[ "$code" =~ ^2 ]]; then printf '    OK   %s (update %s)\n' "$label" "$code"; PASS=$((PASS+1)); return 0; fi
+    if [[ "$code" =~ ^2 ]]; then
+      printf '    OK   %s (update %s)\n' "$label" "$code"; PASS=$((PASS+1))
+      record_result "$label" ok "$code" ""; return 0
+    fi
+    log_raw_error "$label (update)" "$code" "$resp"
   fi
-  printf '    FAIL %s (%s) %s\n' "$label" "$code" "$(echo "$resp" | jq -r '.message // empty' 2>/dev/null | head -c 160)" >&2
-  FAIL=$((FAIL+1)); FAILED+=("$label ($code)"); return 1
+  msg="$(echo "$resp" | jq -r '.message // empty' 2>/dev/null)"; [[ -z "$msg" ]] && msg="$resp"
+  msg="$(printf '%s' "$msg" | tr '\n\r\t' '   ')"
+  printf '    FAIL %s (%s) %s\n' "$label" "$code" "$msg" >&2
+  FAIL=$((FAIL+1)); FAILED+=("$label ($code)")
+  record_result "$label" failed "$code" "$msg"
+  return 1
+}
+
+# ---- summary CSV / retry plumbing ------------------------------------------
+# csv_escape FIELD — same contract as restore-from-audit.sh's: quote only when
+# the field contains a comma or a quote, doubling internal quotes. Error text
+# has already had its newlines flattened by req(), so a cell can never span
+# lines — which matters because the reader below is line-oriented and ONE
+# multi-line cell would silently corrupt every row after it.
+csv_escape() {
+  local f="$1"
+  if [[ "$f" == *,* || "$f" == *'"'* ]]; then
+    f="${f//\"/\"\"}"
+    printf '"%s"' "$f"
+  else
+    printf '%s' "$f"
+  fi
+}
+csv_unquote() {
+  local f="$1"
+  if [[ "$f" == \"*\" && "$f" == *\" ]]; then
+    f="${f#\"}"; f="${f%\"}"; f="${f//\"\"/\"}"
+  fi
+  printf '%s' "$f"
+}
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# entity_remote_file TYPE ID SCDIR -> path to the entity's git "address card"
+#   (.remote.json), or empty if it isn't a git-linked pipeline/template.
+#   Templates are keyed identifier+versionLabel, and req() labels them
+#   "template/<id>/<ver>", so the ID arriving here is "<id>/<ver>" and the
+#   file on disk is "<id>__<ver>.remote.json".
+entity_remote_file() {
+  local t="$1" i="$2" d="$3" f=""
+  case "$t" in
+    pipeline) f="$IN/$d/pipelines/$i.remote.json" ;;
+    template) f="$IN/$d/templates/${i%/*}__${i##*/}.remote.json" ;;
+    *) return ;;
+  esac
+  [[ -e "$f" ]] && printf '%s' "$f"
+}
+
+# entity_webhook_file ID SCDIR -> path to the webhook's JSON, or empty
+entity_webhook_file() {
+  local f="$IN/$2/webhooks/$1.json"
+  [[ -e "$f" ]] && printf '%s' "$f"
+}
+
+# classify_failure ERROR -> "<retryable:0|1>|<reason>"
+#   Decides whether an operator editing Branch/GitFilePath/ConnectorRef could
+#   plausibly fix this row. Anything we can't positively identify is treated
+#   as RETRYABLE — a pointless retry round costs the operator one keypress,
+#   whereas wrongly branding something NOT RETRYABLE hides a fixable problem.
+classify_failure() {
+  case "$1" in
+    *"Unable to retrieve template with identifier"*)
+      printf '0|NOT RETRYABLE - MISSING TEMPLATE DEPENDENCY' ;;
+    *"requested file path"*|*"exists on the branch"*)
+      printf '1|FILE NOT FOUND IN GIT - FIX Branch OR GitFilePath' ;;
+    *"Error occurred while creating webhook"*)
+      printf '1|WEBHOOK REJECTED - CHECK ConnectorRef RESOLVES AT THIS SCOPE' ;;
+    *)
+      printf '1|SEE Error COLUMN' ;;
+  esac
+}
+
+SUMMARY_CSV=""
+
+# write_summary_csv ROUND
+#   Collapses RESULTS to the LAST record per type+id (a create that 400s then
+#   succeeds on update is one entity with one final outcome, not two), then
+#   emits the operator-facing CSV with failures sorted to the top.
+#
+#   CARRY_FORWARD holds rows from earlier rounds that are no longer attempted
+#   — successes and NOT RETRYABLE alike. They are re-emitted verbatim every
+#   round so the CSV stays a complete record of the whole restore: a row that
+#   can never be fixed by editing must not quietly disappear from the file the
+#   operator is treating as the source of truth.
+write_summary_csv() {
+  # NOTE: `local a="$1" b="...$a..."` does NOT work — bash expands every
+  # argument of `local` before assigning any of them, so $a is still unset
+  # (and fatal under `set -u`). Keep the dependent assignment on its own line.
+  local round="$1"
+  local out="$IN/summary-run${round}.csv"
+  local rec t i v s c e d
+  local remote wh branch gitpath connref repo localf reason retryable status
+  SUMMARY_CSV="$out"
+  {
+    echo "Type,Identifier,Status,Reason,Branch,GitFilePath,ConnectorRef,Repo,LocalFile,Error"
+    # failures first, then everything else — both groups stable-sorted by type+id
+    jq -s -r '
+      group_by(.type + "/" + .id) | map(.[-1])
+      | sort_by(.type, .id)
+      | (map(select(.status=="failed")) + map(select(.status!="failed")))
+      | .[] | @base64' "$RESULTS" 2>/dev/null | while IFS= read -r rec; do
+      [[ -z "$rec" ]] && continue
+      rec="$(printf '%s' "$rec" | base64 --decode)"
+      t="$(printf '%s' "$rec" | jq -r '.type')"
+      i="$(printf '%s' "$rec" | jq -r '.id')"
+      s="$(printf '%s' "$rec" | jq -r '.status')"
+      e="$(printf '%s' "$rec" | jq -r '.error')"
+      d="$(printf '%s' "$rec" | jq -r '.scdir')"
+      branch=""; gitpath=""; connref=""; repo=""; localf=""; reason=""
+      remote="$(entity_remote_file "$t" "$i" "$d")"
+      if [[ -n "$remote" ]]; then
+        branch="$(jq -r '.branch // ""' "$remote")"
+        gitpath="$(jq -r '.filePath // ""' "$remote")"
+        connref="$(jq -r '.connectorRef // ""' "$remote")"
+        repo="$(jq -r '.repoName // ""' "$remote")"
+        localf="${remote#"$IN"/}"
+      elif [[ "$t" == webhook ]]; then
+        wh="$(entity_webhook_file "$i" "$d")"
+        if [[ -n "$wh" ]]; then
+          connref="$(jq -r '.spec.connector_ref // ""' "$wh")"
+          repo="$(jq -r '.spec.repo_name // ""' "$wh")"
+          localf="${wh#"$IN"/}"
+        fi
+      fi
+      case "$s" in
+        ok)      status="yes"; reason="" ;;
+        skipped) status="skipped"; reason="$e"; e="" ;;
+        *)
+          IFS='|' read -r retryable reason <<< "$(classify_failure "$e")"
+          if [[ "$retryable" == "0" ]]; then status="NOT RETRYABLE"; else status="failed"; fi
+          ;;
+      esac
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(csv_escape "$t")" "$(csv_escape "$i")" "$(csv_escape "$status")" \
+        "$(csv_escape "$reason")" "$(csv_escape "$branch")" "$(csv_escape "$gitpath")" \
+        "$(csv_escape "$connref")" "$(csv_escape "$repo")" "$(csv_escape "$localf")" \
+        "$(csv_escape "$e")"
+    done
+    [[ -s "$CARRY_FORWARD" ]] && cat "$CARRY_FORWARD"
+  } > "$out"
+}
+
+# json_set_field FILE [jq args...] EXPR -> rewrite FILE in place via a temp
+#   (jq can't safely read and write the same file). Leaves the original
+#   untouched if jq fails or produces nothing, rather than truncating it.
+json_set_field() {
+  local f="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  if jq "$@" "$f" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    cat "$tmp" > "$f"
+  fi
+  rm -f "$tmp"
+}
+
+# read_summary_csv CSVFILE
+#   Reads the operator's edits back and does three things per row:
+#     1. rows still marked `failed` -> added to the retry allowlist
+#     2. their Branch / GitFilePath / ConnectorRef -> written into the backing
+#        address-card / webhook file, which is what import actually reads
+#     3. everything else (yes / NOT RETRYABLE / skipped) -> copied verbatim
+#        into CARRY_FORWARD so the next round's CSV still lists it
+#   Sets PATCHED and RETRY_COUNT. Returns 1 if the file is unreadable.
+PATCHED=0; RETRY_COUNT=0
+read_summary_csv() {
+  local csv="$1" row=0 c1 c2 c3 c4 c5 c6 c7 c8 c9 _rest
+  local t i status branch gitpath connref localf f
+  [[ -r "$csv" ]] || { echo "  can't read $csv" >&2; return 1; }
+  : > "$RETRY_ONLY"; : > "$CARRY_FORWARD"
+  PATCHED=0; RETRY_COUNT=0
+  # Same trailing-newline guard as restore-from-audit.sh: `read` returns
+  # non-zero on a final unterminated line, which would drop the last row.
+  while IFS=, read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 _rest; do
+    row=$((row+1))
+    [[ "$row" -eq 1 ]] && continue
+    [[ -z "$c1" && -z "$c2" ]] && continue
+    t="$(csv_unquote "$c1")"; i="$(csv_unquote "$c2")"
+    status="$(printf '%s' "$(trim "$(csv_unquote "$c3")")" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$status" != "failed" ]]; then
+      # Not being retried — preserve the row exactly as it stands.
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$c1" "$c2" "$c3" "$c4" "$c5" "$c6" "$c7" "$c8" "$c9" "$_rest" >> "$CARRY_FORWARD"
+      continue
+    fi
+    branch="$(trim "$(csv_unquote "$c5")")"; gitpath="$(trim "$(csv_unquote "$c6")")"
+    connref="$(trim "$(csv_unquote "$c7")")"; localf="$(trim "$(csv_unquote "$c9")")"
+    printf '%s\t%s\n' "$t" "$i" >> "$RETRY_ONLY"
+    RETRY_COUNT=$((RETRY_COUNT+1))
+    # Write the operator's values into the file import actually reads. Without
+    # this the whole loop is theatre: import re-reads the address card, not
+    # the CSV, so a corrected branch would never reach the API call.
+    [[ -z "$localf" ]] && continue
+    f="$IN/$localf"
+    [[ -e "$f" ]] || { echo "    WARN $t/$i: LocalFile '$localf' not found — edits to this row can't be applied" >&2; continue; }
+    case "$f" in
+      *.remote.json)
+        [[ -n "$branch" ]]  && json_set_field "$f" --arg v "$branch"  '.branch   = $v'
+        [[ -n "$gitpath" ]] && json_set_field "$f" --arg v "$gitpath" '.filePath = $v'
+        [[ -n "$connref" ]] && json_set_field "$f" --arg v "$connref" '.connectorRef = $v'
+        PATCHED=$((PATCHED+1))
+        ;;
+      */webhooks/*.json)
+        [[ -n "$connref" ]] && { json_set_field "$f" --arg v "$connref" '.spec.connector_ref = $v'; PATCHED=$((PATCHED+1)); }
+        ;;
+    esac
+  done < <(cat "$csv"; echo)
+  return 0
+}
+
+# ---- FORCE: convert unreachable git-linked entities to inline --------------
+# A git-linked pipeline/template whose file can't be found in git can still be
+# recreated from the content the restore captured at delete time: every
+# address card carries a `yaml` field with that last-known content, which the
+# git-import path never uses (it tells Harness to read the file from the repo
+# instead). Converting means writing that YAML out as a normal inline entity
+# and retiring the address card.
+#
+# This is a REAL CHANGE to how the entity is managed — it stops being
+# git-backed — which is why it's opt-in per row and recorded in a CSV the
+# operator keeps. Two things make a row unconvertible, and both are reported
+# rather than silently skipped:
+#   - no recovered content (the delete event carried no oldYaml)
+#   - the content references a template that failed to import this run, so an
+#     inline create would just fail again with the same template error
+FORCE_CSV=""
+
+# missing_template_ids -> template identifiers that failed this round with
+#   "Unable to retrieve template with identifier [X]". Used to pre-flag rows
+#   whose recovered YAML would hit the same wall.
+missing_template_ids() {
+  jq -r 'select(.status=="failed") | .error' "$RESULTS" 2>/dev/null \
+    | grep -oE 'Unable to retrieve template with identifier \[[^]]*' \
+    | sed -E 's/.*\[//' | sort -u
+}
+
+# write_force_csv -> builds force-inline-review.csv from the still-failing,
+#   git-linked rows. Returns 1 if there's nothing eligible.
+write_force_csv() {
+  local out="$IN/force-inline-review.csv" rec t i d remote ylen reason n=0
+  local missing; missing="$(missing_template_ids)"
+  FORCE_CSV="$out"
+  {
+    echo "Type,Identifier,ConvertToInline,Reason,Repo,Branch,GitFilePath,LocalFile"
+    while IFS= read -r rec; do
+      [[ -z "$rec" ]] && continue
+      rec="$(printf '%s' "$rec" | base64 --decode)"
+      t="$(printf '%s' "$rec" | jq -r '.type')"
+      i="$(printf '%s' "$rec" | jq -r '.id')"
+      d="$(printf '%s' "$rec" | jq -r '.scdir')"
+      remote="$(entity_remote_file "$t" "$i" "$d")"
+      [[ -z "$remote" ]] && continue     # not git-linked; inline conversion is meaningless
+      ylen="$(jq -r '(.yaml // "") | length' "$remote" 2>/dev/null)"
+      reason="FILE NOT FOUND IN GIT"
+      if [[ "${ylen:-0}" -eq 0 ]]; then
+        reason="CANNOT CONVERT - NO RECOVERED CONTENT"
+      elif [[ -n "$missing" ]]; then
+        while IFS= read -r mt; do
+          [[ -z "$mt" ]] && continue
+          if jq -r '.yaml // ""' "$remote" 2>/dev/null | grep -qF "$mt"; then
+            reason="CANNOT CONVERT - REFERENCES MISSING TEMPLATE $mt"; break
+          fi
+        done <<< "$missing"
+      fi
+      n=$((n+1))
+      printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(csv_escape "$t")" "$(csv_escape "$i")" "" "$(csv_escape "$reason")" \
+        "$(csv_escape "$(jq -r '.repoName // ""' "$remote")")" \
+        "$(csv_escape "$(jq -r '.branch // ""' "$remote")")" \
+        "$(csv_escape "$(jq -r '.filePath // ""' "$remote")")" \
+        "$(csv_escape "${remote#"$IN"/}")"
+    done < <(jq -s -r 'group_by(.type + "/" + .id) | map(.[-1])
+                       | map(select(.status=="failed")) | sort_by(.type, .id) | .[] | @base64' "$RESULTS" 2>/dev/null)
+  } > "$out"
+  [[ "$n" -gt 0 ]] || { rm -f "$out"; return 1; }
+  FORCE_ELIGIBLE="$n"
+  return 0
+}
+
+# apply_force_csv -> reads the marked CSV, converts approved rows to inline,
+#   and loads RETRY_ONLY with exactly those rows so the next round imports
+#   them. Sets FORCE_DONE / FORCE_BLOCKED.
+FORCE_ELIGIBLE=0; FORCE_DONE=0; FORCE_BLOCKED=0
+apply_force_csv() {
+  local row=0 c1 c2 c3 c4 c5 c6 c7 c8 _rest t i mark localf f yaml target mt blocker
+  local missing; missing="$(missing_template_ids)"
+  FORCE_DONE=0; FORCE_BLOCKED=0
+  : > "$RETRY_ONLY"
+  while IFS=, read -r c1 c2 c3 c4 c5 c6 c7 c8 _rest; do
+    row=$((row+1))
+    [[ "$row" -eq 1 ]] && continue
+    [[ -z "$c1" && -z "$c2" ]] && continue
+    mark="$(printf '%s' "$(trim "$(csv_unquote "$c3")")" | tr '[:upper:]' '[:lower:]')"
+    case "$mark" in yes|y) : ;; *) continue ;; esac
+    t="$(csv_unquote "$c1")"; i="$(csv_unquote "$c2")"; localf="$(trim "$(csv_unquote "$c8")")"
+    f="$IN/$localf"
+    if [[ -z "$localf" || ! -e "$f" ]]; then
+      echo "    SKIP $t/$i (force) — address card '$localf' not found"; FORCE_BLOCKED=$((FORCE_BLOCKED+1)); continue
+    fi
+    yaml="$(jq -r '.yaml // ""' "$f" 2>/dev/null)"
+    if [[ -z "$yaml" ]]; then
+      echo "    SKIP $t/$i (force) — no recovered content to build an inline entity from"; FORCE_BLOCKED=$((FORCE_BLOCKED+1)); continue
+    fi
+    # Re-derive the blocking conditions here instead of trusting the CSV's
+    # Reason column: that column is script-written and advisory, and an
+    # operator who marks every row Yes (or edits/clears Reason) must still not
+    # be able to force through a conversion that is certain to fail. Writing
+    # an inline entity that references a template which just failed to import
+    # would only swap "file not found in git" for the identical template
+    # error on the very next round — a silent no-progress loop.
+    blocker=""
+    if [[ -n "$missing" ]]; then
+      while IFS= read -r mt; do
+        [[ -z "$mt" ]] && continue
+        if printf '%s' "$yaml" | grep -qF "$mt"; then blocker="$mt"; break; fi
+      done <<< "$missing"
+    fi
+    if [[ -n "$blocker" ]]; then
+      echo "    SKIP $t/$i (force) — recovered content references template '$blocker', which failed to import this run."
+      echo "         Restore that template first; converting now would fail again with the same error."
+      FORCE_BLOCKED=$((FORCE_BLOCKED+1)); continue
+    fi
+    # Inline filename mirrors what a normal (non-git) restore would have
+    # written, so the existing import loops pick it up with no special casing:
+    # pipelines/<id>.yaml, templates/<id>__<ver>.yaml.
+    target="${f%.remote.json}.yaml"
+    printf '%s\n' "$yaml" > "$target"
+    rm -f "$f"
+    printf '%s\t%s\n' "$t" "$i" >> "$RETRY_ONLY"
+    echo "    FORCED $t/$i -> inline (${target#"$IN"/}), git link retired"
+    FORCE_DONE=$((FORCE_DONE+1))
+  done < <(cat "$FORCE_CSV"; echo)
 }
 
 echo "=== Importing $IN -> account $ACC @ $BASE  (DRY_RUN=$DRY) ==="
@@ -321,6 +798,15 @@ if [[ "$PROJECT_MODE" -eq 1 ]]; then
 fi
 echo "Scope dirs: ${SCDIRS[*]}"
 
+# ---- one full import pass ---------------------------------------------------
+# Wrapped in a function so the retry loop at the bottom can run it again after
+# the operator corrects branches/paths/connectors. Deliberately NOT re-indented
+# — keeping the body byte-identical to the single-pass version it replaces
+# makes the diff reviewable; the only functional additions inside are the
+# `should_attempt` guards and the record_result calls on the two SKIP paths
+# that bypass req().
+run_import_pass() {
+
 # ---- 1. projects (org 'default' assumed to exist) --------------------------
 echo "== projects =="
 if [[ -f "$IN/scope.json" ]]; then
@@ -335,6 +821,7 @@ if [[ -f "$IN/scope.json" ]]; then
       org="$src_org"; pid="$src_pid"
       payload=$(echo "$p" | jq --arg a "$ACC" '{project: (. + {accountIdentifier:$a})}')
     fi
+    should_attempt "project" "$org/$pid" || continue
     req POST "$BASE/ng/api/projects?accountIdentifier=$ACC&orgIdentifier=$org&routingId=$ACC" json "$payload" "project/$org/$pid"
     [[ $? -eq 9 ]] && req PUT "$BASE/ng/api/projects/$pid?accountIdentifier=$ACC&orgIdentifier=$org&routingId=$ACC" json "$payload" "project/$org/$pid (update)"
   done
@@ -365,6 +852,7 @@ for SCDIR in "${SCDIRS[@]}"; do
     tid="$(yaml_get "$f" ".template.identifier")"
     tver="$(yaml_get "$f" ".template.versionLabel")"
     [[ -z "$tid" || "$tid" == "null" ]] && continue
+    should_attempt "template" "$tid/$tver" || continue
     tbody="$(rewrite_scope_yaml "$f" "template" "$torg" "$tproj")"
     req POST "$BASE/template/api/templates?$tqs&routingId=$ACC" yaml "$tbody" "template/$tid/$tver"
     [[ $? -eq 9 ]] && req PUT "$BASE/template/api/templates/update/$tid/$tver?$tqs&routingId=$ACC" yaml "$tbody" "template/$tid/$tver (update)"
@@ -384,6 +872,7 @@ for SCDIR in "${SCDIRS[@]}"; do
   for f in "$IN/$SCDIR"/templates/*.remote.json; do [[ -e "$f" ]] || continue
     tqs="$(scope_qs "$SC")"
     base="$(basename "$f" .remote.json)"; tid="${base%__*}"; tver="${base##*__}"
+    should_attempt "template" "$tid/$tver" || continue
     connectorRef="$(jq -r '.connectorRef' "$f")"; repoName="$(jq -r '.repoName' "$f")"
     filePath="$(jq -r '.filePath' "$f")"; branch="$(jq -r '.branch // ""' "$f")"
     importqs="connectorRef=$connectorRef&isHarnessCodeRepo=false&repoName=$repoName&branch=$branch&filePath=$filePath"
@@ -391,6 +880,7 @@ for SCDIR in "${SCDIRS[@]}"; do
     if [[ $? -eq 9 ]]; then
       echo "    SKIP template/$tid/$tver (git-import) (already exists in target — this script doesn't re-import an already-imported git-linked template; delete it in target first if you need to re-run)"
       SKIP=$((SKIP+1))
+      record_result "template/$tid/$tver (git-import)" skipped "" "already imported from git in target"
     fi
   done
 
@@ -398,30 +888,36 @@ for SCDIR in "${SCDIRS[@]}"; do
   for f in "$IN/$SCDIR"/connectors/*.json; do [[ -e "$f" ]] || continue
     cid="$(basename "$f" .json)"
     if is_builtin "$cid"; then echo "    skip connector/$cid (Harness built-in)"; SKIP=$((SKIP+1)); continue; fi
+    should_attempt "connector" "$cid" || continue
     upsert_json "ng/api/connectors" "$SC" "connector" "$f" "connector/$cid"; done
 
   # service accounts (JSON, no wrap; update PUTs to /serviceaccount/{id})
   for f in "$IN/$SCDIR"/serviceaccounts/*.json; do [[ -e "$f" ]] || continue
     said="$(basename "$f" .json)"
+    should_attempt "serviceaccount" "$said" || continue
     upsert_json_pathid "ng/api/serviceaccount" "$SC" "" "$f" "serviceaccount/$said" "$said"; done
 
   # user groups (JSON, no wrap) — blank users[] (principals not replicated)
   for f in "$IN/$SCDIR"/usergroups/*.json; do [[ -e "$f" ]] || continue
+    should_attempt "usergroup" "$(basename "$f" .json)" || continue
     tmp="$(mktemp)"; jq '.users = []' "$f" > "$tmp"
     upsert_json "ng/api/user-groups" "$SC" "" "$tmp" "usergroup/$(basename "$f" .json)"; rm -f "$tmp"; done
 
   # services (JSON DTO: identifier/name/scope + yaml string)
   for f in "$IN/$SCDIR"/services/*.yaml; do [[ -e "$f" ]] || continue
+    should_attempt "service" "$(basename "$f" .yaml)" || continue
     upsert_dto "ng/api/servicesV2" "$SC" "service" "$f" "service/$(basename "$f" .yaml)"; done
 
   # environments (JSON DTO: + type)
   for f in "$IN/$SCDIR"/environments/*.yaml; do [[ -e "$f" ]] || continue
+    should_attempt "environment" "$(basename "$f" .yaml)" || continue
     upsert_dto "ng/api/environmentsV2" "$SC" "environment" "$f" "environment/$(basename "$f" .yaml)"; done
 
   # infrastructures (JSON DTO + environmentIdentifier query param from <env>.infra)
   for d in "$IN/$SCDIR"/environments/*.infra; do [[ -d "$d" ]] || continue
     env="$(basename "$d" .infra)"
     for f in "$d"/*.yaml; do [[ -e "$f" ]] || continue
+      should_attempt "infra" "$env/$(basename "$f" .yaml)" || continue
       upsert_dto "ng/api/infrastructures" "$SC" "infrastructureDefinition" "$f" "infra/$env/$(basename "$f" .yaml)" "&environmentIdentifier=$env"
     done
   done
@@ -434,7 +930,9 @@ for SCDIR in "${SCDIRS[@]}"; do
       */*) porg="${SC%%/*}"; pproj="${SC#*/}"; qs="$(scope_qs "$SC")" ;;
       *) echo "    SKIP pipeline (account-scope pipelines unsupported)"; SKIP=$((SKIP+1)); continue ;;
     esac
-    body="$(rewrite_scope_yaml "$f" "pipeline" "$porg" "$pproj")"; pid="$(basename "$f" .yaml)"
+    pid="$(basename "$f" .yaml)"
+    should_attempt "pipeline" "$pid" || continue
+    body="$(rewrite_scope_yaml "$f" "pipeline" "$porg" "$pproj")"
     req POST "$BASE/pipeline/api/pipelines/v2?$qs&routingId=$ACC" yaml "$body" "pipeline/$pid"
     [[ $? -eq 9 ]] && req PUT "$BASE/pipeline/api/pipelines/v2/$pid?$qs&routingId=$ACC" yaml "$body" "pipeline/$pid (update)"
   done
@@ -456,6 +954,7 @@ for SCDIR in "${SCDIRS[@]}"; do
       *) echo "    SKIP git-linked pipeline (account-scope pipelines unsupported)"; SKIP=$((SKIP+1)); continue ;;
     esac
     pid="$(basename "$f" .remote.json)"
+    should_attempt "pipeline" "$pid" || continue
     connectorRef="$(jq -r '.connectorRef' "$f")"; repoName="$(jq -r '.repoName' "$f")"
     filePath="$(jq -r '.filePath' "$f")"; branch="$(jq -r '.branch // ""' "$f")"
     importqs="connectorRef=$connectorRef&isHarnessCodeRepo=false&repoName=$repoName&branch=$branch&filePath=$filePath"
@@ -463,6 +962,7 @@ for SCDIR in "${SCDIRS[@]}"; do
     if [[ $? -eq 9 ]]; then
       echo "    SKIP pipeline/$pid (git-import) (already exists in target — this script doesn't re-import an already-imported git-linked pipeline; delete it in target first if you need to re-run)"
       SKIP=$((SKIP+1))
+      record_result "pipeline/$pid (git-import)" skipped "" "already imported from git in target"
     fi
   done
 
@@ -484,9 +984,12 @@ for SCDIR in "${SCDIRS[@]}"; do
       *) echo "    SKIP trigger (account-scope triggers unsupported)"; SKIP=$((SKIP+1)); continue ;;
     esac
     tid="$(basename "$f" .yaml)"
+    should_attempt "trigger" "$tid" || continue
     pid="$(yaml_get "$f" ".trigger.pipelineIdentifier")"
     if [[ -z "$pid" || "$pid" == "null" ]]; then
-      echo "    SKIP trigger/$tid (couldn't determine target pipelineIdentifier)"; SKIP=$((SKIP+1)); continue
+      echo "    SKIP trigger/$tid (couldn't determine target pipelineIdentifier)"; SKIP=$((SKIP+1))
+      record_result "trigger/$tid" skipped "" "couldn't determine target pipelineIdentifier"
+      continue
     fi
     body="$(rewrite_scope_yaml "$f" "trigger" "$torg" "$tproj")"
     gitqs=""
@@ -514,6 +1017,7 @@ for SCDIR in "${SCDIRS[@]}"; do
   # that call before trusting it further.
   for f in "$IN/$SCDIR"/webhooks/*.json; do [[ -e "$f" ]] || continue
     wid="$(basename "$f" .json)"
+    should_attempt "webhook" "$wid" || continue
     case "$SC" in
       */*) worg="${SC%%/*}"; wproj="${SC#*/}" ;;
       *) echo "    SKIP webhook/$wid (account-scope webhooks unsupported)"; SKIP=$((SKIP+1)); continue ;;
@@ -527,11 +1031,109 @@ for SCDIR in "${SCDIRS[@]}"; do
   case "$SC" in
     */*) org="${SC%%/*}"; proj="${SC#*/}"
       for f in "$IN/$SCDIR"/iacm-workspaces/*.json; do [[ -e "$f" ]] || continue
+        should_attempt "iacm-workspace" "$proj/$(jq -r '.identifier' "$f")" || continue
         upsert_iacm_workspace "$org" "$proj" "$f"; done ;;
   esac
 done
 
+}  # end run_import_pass
+
+# ---- import, then loop on failures until resolved or abandoned -------------
+# Rather than exiting on failure, each round writes summary-run<N>.csv listing
+# every entity with its status and FULL error, then hands control back to the
+# operator. They can correct Branch / GitFilePath / ConnectorRef in that same
+# file and retry (only the rows still marked `failed` are re-attempted), FORCE
+# unreachable git-linked entities to inline, or stop.
+while :; do
+  : > "$RESULTS"
+  if [[ "$RETRY_ACTIVE" -eq 1 ]]; then
+    echo
+    echo "=== Retry round $RUN_ROUND — re-attempting $RETRY_COUNT entit$([[ "$RETRY_COUNT" == 1 ]] && echo y || echo ies) ==="
+  fi
+  PASS=0; FAIL=0; SKIP=0; FAILED=()
+
+  run_import_pass
+
+  echo
+  echo "=== Summary: $PASS ok, $FAIL failed, $SKIP skipped ==="
+  if [[ ${#FAILED[@]} -gt 0 ]]; then printf '  - %s\n' "${FAILED[@]}"; fi
+
+  write_summary_csv "$RUN_ROUND"
+  echo "Review file: $SUMMARY_CSV"
+  [[ -s "$ERRLOG" ]] && echo "Full untruncated API responses for every failure: $ERRLOG"
+
+  # Nothing left to act on — note that FAIL counts only THIS round, so a
+  # carried-forward NOT RETRYABLE row doesn't keep the loop spinning forever.
+  if [[ "$FAIL" -eq 0 ]]; then
+    echo "No failures in this round — nothing left to retry."
+    break
+  fi
+
+  echo
+  echo "Failed rows are listed first in $SUMMARY_CSV, with the full error in the Error column."
+  echo "  - To RETRY: open it, fix Branch / GitFilePath / ConnectorRef on the rows marked 'failed'"
+  echo "    (check the repo yourself to confirm which branch actually holds the YAML), save as CSV"
+  echo "    at the same path, then press Enter. Only rows still marked 'failed' are re-attempted;"
+  echo "    set Status to 'no' on anything you want left alone."
+  echo "  - Rows marked NOT RETRYABLE cannot be fixed by editing this file (e.g. a missing org-level"
+  echo "    template). They are kept in every round's CSV for the record, but never re-attempted."
+  echo "  - To FORCE: type FORCE to convert unreachable git-linked pipelines/templates into inline"
+  echo "    entities built from the content captured at delete time. They will STOP being git-backed."
+  echo "  - To STOP: type terminate."
+  echo
+
+  while :; do
+    read -r -p "[Enter] retry · [FORCE] convert to inline · [terminate] stop: " _reply
+    case "$(printf '%s' "$_reply" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+      terminate|abort|quit)
+        echo "Stopping at operator request. $SUMMARY_CSV holds the current state."
+        break 2
+        ;;
+      force)
+        if ! write_force_csv; then
+          echo "  Nothing eligible to force — no failing entity is git-linked." ; continue
+        fi
+        echo
+        echo "  $FORCE_ELIGIBLE git-linked entit$([[ "$FORCE_ELIGIBLE" == 1 ]] && echo y || echo ies) can be offered for inline conversion."
+        echo "  Wrote $FORCE_CSV"
+        echo "  Mark ConvertToInline=Yes on each row you want converted (blank = leave it alone)."
+        echo "  Check the Reason column first — rows reading 'CANNOT CONVERT' will be skipped even if marked Yes."
+        echo "  Converted entities STOP being git-backed; re-link them in Harness afterwards if you want them in git again."
+        read -r -p "  Press Enter once you've saved $FORCE_CSV (or type cancel): " _freply
+        case "$(printf '%s' "$_freply" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+          cancel|c) echo "  Force cancelled."; continue ;;
+        esac
+        apply_force_csv
+        if [[ "$FORCE_DONE" -eq 0 ]]; then
+          echo "  Nothing converted ($FORCE_BLOCKED row(s) blocked, 0 marked Yes). Back to the prompt."
+          continue
+        fi
+        echo "  Converted $FORCE_DONE to inline; $FORCE_BLOCKED blocked."
+        echo "  $FORCE_CSV is your record of what changed — keep it."
+        # RETRY_ONLY was loaded by apply_force_csv with exactly the converted
+        # rows. Rebuild carry-forward from the current CSV so unconverted and
+        # already-succeeded rows still appear in the next summary.
+        awk -F, 'NR>1' "$SUMMARY_CSV" > "$CARRY_FORWARD"
+        RETRY_COUNT="$FORCE_DONE"; RETRY_ACTIVE=1; RUN_ROUND=$((RUN_ROUND+1))
+        break
+        ;;
+      "")
+        if ! read_summary_csv "$SUMMARY_CSV"; then continue; fi
+        if [[ "$RETRY_COUNT" -eq 0 ]]; then
+          echo "  No rows left marked 'failed' in $SUMMARY_CSV — nothing to retry."
+          echo "  Mark a row's Status back to 'failed' to re-attempt it, or type terminate."
+          continue
+        fi
+        echo "  $RETRY_COUNT row(s) to retry; applied edits to $PATCHED backing file(s)."
+        RETRY_ACTIVE=1; RUN_ROUND=$((RUN_ROUND+1))
+        break
+        ;;
+      *)
+        echo "  Didn't understand that. Press Enter to retry, or type FORCE / terminate."
+        ;;
+    esac
+  done
+done
+
 echo
-echo "=== Summary: $PASS ok, $FAIL failed, $SKIP skipped ==="
-if [[ ${#FAILED[@]} -gt 0 ]]; then printf '  - %s\n' "${FAILED[@]}"; fi
 echo "Reminder: recreate secrets first (see $IN/secrets-manifest.md); connectors/pipelines referencing them will fail validation until then."

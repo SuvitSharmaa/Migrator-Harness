@@ -175,12 +175,15 @@ get_checked() {
     echo "  Check that SRC_BASE_URL points at the right cluster/gateway" >&2
     echo "  (SaaS accounts usually need a /gateway suffix, e.g. https://app.harness.io/gateway)" >&2
     echo "  and that HARNESS_TOKEN is valid, unexpired, and has read access to account $ACC." >&2
-    echo "  Response: $(echo "$body" | head -c 300)" >&2
+    # Untruncated on purpose: this is a fatal path, and the tail of a Harness
+    # error body is often where the actual cause lives (a 300-char cut kept
+    # showing only the generic prefix).
+    echo "  Response: $body" >&2
     exit 1
   fi
   if ! echo "$body" | jq -e '.data.content' >/dev/null 2>&1; then
     echo "ERROR: $label returned HTTP 200 but not the expected shape (.data.content missing)." >&2
-    echo "  Response: $(echo "$body" | head -c 300)" >&2
+    echo "  Response: $body" >&2
     exit 1
   fi
   printf '%s' "$body"
