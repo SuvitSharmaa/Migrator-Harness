@@ -3,3 +3,8 @@
 .env
 .claude/settings.local.json
 customer-exports/
+
+# migrate.sh/export.sh default output dir — real org/connector/pipeline config
+# pulled from a customer account. Never commit it.
+harness-export/
+.DS_Store

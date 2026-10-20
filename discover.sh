@@ -5,7 +5,12 @@ set -uo pipefail
 TOKEN="${HARNESS_TOKEN:?set HARNESS_TOKEN}"
 ACC="${ACCOUNT_ID:-ZmMyYzk4NDktZmU4Ny00Zm}"
 BASE="${HARNESS_BASE_URL:-https://prod5.harness.io/gateway}"
-H=(-H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -H 'accept: */*')
+# Auth header: a real API key uses x-api-key; a UI JWT uses Authorization: Bearer.
+if [[ "$TOKEN" == pat.* || "$TOKEN" == sat.* ]]; then
+  H=(-H "x-api-key: $TOKEN" -H 'content-type: application/json' -H 'accept: */*')
+else
+  H=(-H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -H 'accept: */*')
+fi
 
 # scopes: "account" then each project as "org/project"
 PROJECTS=("default/KarpoInfra" "default/Alice")
